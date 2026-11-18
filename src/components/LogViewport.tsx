@@ -1,5 +1,5 @@
-import { ArrowDown, ChevronDown, ChevronRight, FileText, RotateCcw } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { AlertTriangle, ArrowDown, ChevronDown, ChevronRight, FileText, RotateCcw, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FilterState, LogEntry, LogLevel } from '../types/k8s';
 
 interface LogViewportProps {
@@ -119,10 +119,64 @@ export function LogViewport({
   contextMatchIds,
 }: LogViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const [autoScroll, setAutoScroll] = useState(true);
   const [newLogCountWhilePaused, setNewLogCountWhilePaused] = useState(0);
   const prevLenRef = useRef(entries.length);
   const [expandedStacks, setExpandedStacks] = useState<Record<string, boolean>>({});
+  const [dismissedCount, setDismissedCount] = useState<number | null>(null);
+  const [matchCursor, setMatchCursor] = useState(0);
+
+  const alertDetection = useMemo(() => {
+    const matchedEntries: LogEntry[] = [];
+    let exceptionHits = 0;
+    let criticalHits = 0;
+
+    for (const entry of entries) {
+      const fullText = entry.stackLines?.length
+        ? `${entry.raw}\n${entry.stackLines.join('\n')}`
+        : entry.raw;
+      const hasException = /Exception/i.test(fullText);
+      const hasCritical = /Critical/i.test(fullText);
+      if (hasException || hasCritical) {
+        matchedEntries.push(entry);
+        if (hasException) exceptionHits += 1;
+        if (hasCritical) criticalHits += 1;
+      }
+    }
+
+    return {
+      matchedEntries,
+      totalHits: matchedEntries.length,
+      exceptionHits,
+      criticalHits,
+    };
+  }, [entries]);
+
+  // Reset dismissed state when match count drops to 0 or increases with new incoming alerts
+  useEffect(() => {
+    if (alertDetection.totalHits === 0) {
+      setDismissedCount(null);
+      setMatchCursor(0);
+    } else if (dismissedCount !== null && alertDetection.totalHits > dismissedCount) {
+      setDismissedCount(null);
+    }
+  }, [alertDetection.totalHits, dismissedCount]);
+
+  const showAlertBanner =
+    alertDetection.totalHits > 0 && dismissedCount !== alertDetection.totalHits;
+
+  const jumpToAlertMatch = () => {
+    if (alertDetection.matchedEntries.length === 0) return;
+    const idx = matchCursor % alertDetection.matchedEntries.length;
+    const target = alertDetection.matchedEntries[idx];
+    const rowEl = rowRefs.current.get(target.id);
+    if (rowEl) {
+      rowEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+    onSelectEntry(target);
+    setMatchCursor((idx + 1) % alertDetection.matchedEntries.length);
+  };
 
   useEffect(() => {
     const el = containerRef.current;
@@ -239,6 +293,44 @@ export function LogViewport({
 
   return (
     <div className="relative flex-1 min-h-0 bg-white dark:bg-[#0B0F17] flex flex-col">
+      {showAlertBanner && (
+        <div
+          role="alert"
+          className="shrink-0 px-4 py-1.5 border-b border-red-300 dark:border-red-900/70 bg-red-600/12 dark:bg-red-500/15 text-red-700 dark:text-red-300 flex items-center justify-between gap-3 text-xs animate-pulse"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-3.5 h-3.5 text-red-600 dark:text-red-400 shrink-0" />
+            <span className="font-semibold whitespace-nowrap">高危日志告警</span>
+            <span className="text-red-300 dark:text-red-800" aria-hidden="true">·</span>
+            <span className="font-mono truncate">
+              检测到 {alertDetection.totalHits} 条包含{' '}
+              {alertDetection.exceptionHits > 0 && `Exception (${alertDetection.exceptionHits})`}
+              {alertDetection.exceptionHits > 0 && alertDetection.criticalHits > 0 && ' / '}
+              {alertDetection.criticalHits > 0 && `Critical (${alertDetection.criticalHits})`}
+              {' '}的日志
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={jumpToAlertMatch}
+              className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white text-[11px] font-medium transition-colors whitespace-nowrap"
+            >
+              定位异常行 ({(matchCursor % alertDetection.totalHits) + 1}/{alertDetection.totalHits})
+            </button>
+            <button
+              type="button"
+              onClick={() => setDismissedCount(alertDetection.totalHits)}
+              aria-label="关闭告警提示"
+              className="p-0.5 rounded text-red-600 dark:text-red-300 hover:bg-red-500/20 transition-colors"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       <div
         ref={containerRef}
         onScroll={handleScroll}
@@ -258,6 +350,10 @@ export function LogViewport({
             return (
               <div
                 key={entry.id}
+                ref={(el) => {
+                  if (el) rowRefs.current.set(entry.id, el);
+                  else rowRefs.current.delete(entry.id);
+                }}
                 onClick={() => onSelectEntry(entry)}
                 className={`group cursor-pointer px-4 py-[2px] border-b border-transparent transition-colors ${getRowSurfaceStyle(
                   entry.level,
