@@ -1,4 +1,4 @@
-import { Pause, Play, RefreshCw, Search, X } from 'lucide-react';
+import { Layers, Pause, Play, RefreshCw, Search, X } from 'lucide-react';
 import { useRef } from 'react';
 import type { FilterState, LogLevel } from '../types/k8s';
 
@@ -12,6 +12,12 @@ interface LogToolbarProps {
   isLoadingLogs: boolean;
   canLiveTail: boolean;
   searchInputRef: React.RefObject<HTMLInputElement | null>;
+  patternPanelOpen: boolean;
+  patternCount: number;
+  excludedPatternCount: number;
+  focusedPatternActive: boolean;
+  onTogglePatternPanel: () => void;
+  onClearPatternFilters: () => void;
 }
 
 export function LogToolbar({
@@ -24,6 +30,12 @@ export function LogToolbar({
   isLoadingLogs,
   canLiveTail,
   searchInputRef,
+  patternPanelOpen,
+  patternCount,
+  excludedPatternCount,
+  focusedPatternActive,
+  onTogglePatternPanel,
+  onClearPatternFilters,
 }: LogToolbarProps) {
   const excludeInputRef = useRef<HTMLInputElement>(null);
 
@@ -210,9 +222,22 @@ export function LogToolbar({
               <X className="w-3 h-3" />
             </button>
           )}
+
+          {(excludedPatternCount > 0 || focusedPatternActive) && (
+            <button
+              type="button"
+              onClick={onClearPatternFilters}
+              className="h-7 px-2.5 ml-1 rounded bg-amber-500/12 text-amber-700 dark:text-amber-300 text-xs font-mono inline-flex items-center gap-1.5 hover:bg-amber-500/20 transition-colors whitespace-nowrap shrink-0"
+            >
+              <span>
+                {focusedPatternActive ? '仅看 1 类模式' : `已屏蔽 ${excludedPatternCount} 类模式`}
+              </span>
+              <X className="w-3 h-3" />
+            </button>
+          )}
         </div>
 
-        {/* Display Options */}
+        {/* Display Options & Pattern Detection */}
         <div className="flex items-center gap-1.5 flex-wrap">
           {[
             { key: 'showTimestamp' as const, label: '时间戳' },
@@ -237,6 +262,21 @@ export function LogToolbar({
               </button>
             );
           })}
+
+          <span className="h-4 w-px bg-slate-200 dark:bg-slate-800 mx-0.5" aria-hidden="true" />
+
+          <button
+            type="button"
+            onClick={onTogglePatternPanel}
+            className={`h-7 px-2.5 rounded text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 border ${
+              patternPanelOpen
+                ? 'border-sky-500 bg-sky-600 text-white'
+                : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span>模式检测 ({patternCount})</span>
+          </button>
         </div>
       </div>
     </div>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ClusterConnectModal } from './components/ClusterConnectModal';
 import { LogDetailDrawer } from './components/LogDetailDrawer';
 import { LogHistogram } from './components/LogHistogram';
+import { LogPatternPanel } from './components/LogPatternPanel';
 import { LogToolbar } from './components/LogToolbar';
 import { LogViewport } from './components/LogViewport';
 import { Sidebar } from './components/Sidebar';
@@ -22,6 +23,7 @@ import type {
 } from './types/k8s';
 import { fetchNamespaces, fetchPodLogs, fetchPods } from './utils/k8sClient';
 import { exportLogsToFile, parseRawLogs } from './utils/logParser';
+import { aggregateLogPatterns } from './utils/logPatternDetector';
 
 const DEFAULT_SANDBOX_CLUSTER: ClusterConfig = {
   id: 'sandbox-prod',
@@ -97,6 +99,9 @@ export default function App() {
 
   const [filters, setFilters] = useState<FilterState>(INITIAL_FILTERS);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
+  const [patternPanelOpen, setPatternPanelOpen] = useState(false);
+  const [excludedPatternIds, setExcludedPatternIds] = useState<string[]>([]);
+  const [focusedPatternId, setFocusedPatternId] = useState<string | null>(null);
 
   const importedEntriesRef = useRef<LogEntry[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -129,11 +134,12 @@ export default function App() {
       } else if (e.key === 'Escape') {
         if (connectModalOpen) setConnectModalOpen(false);
         else if (selectedEntryId) setSelectedEntryId(null);
+        else if (patternPanelOpen) setPatternPanelOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [connectModalOpen, selectedEntryId]);
+  }, [connectModalOpen, selectedEntryId, patternPanelOpen]);
 
   const loadPodsForCluster = useCallback(
     async (activeCluster: ClusterConfig, ns: string) => {
@@ -270,6 +276,8 @@ export default function App() {
   useEffect(() => {
     loadLogs();
     setSelectedEntryId(null);
+    setExcludedPatternIds([]);
+    setFocusedPatternId(null);
   }, [loadLogs]);
 
   // Live Tail polling / simulation
@@ -344,6 +352,31 @@ export default function App() {
     return counts;
   }, [rawEntries]);
 
+  // Aggregate log patterns using regex masking
+  const patternAggregation = useMemo(
+    () => aggregateLogPatterns(rawEntries),
+    [rawEntries]
+  );
+
+  const patternEntryFilters = useMemo(() => {
+    const focusedEntryIds = focusedPatternId
+      ? patternAggregation.patterns.find((p) => p.id === focusedPatternId)?.entryIds ?? null
+      : null;
+
+    let excludedEntryIds: Set<string> | null = null;
+    if (excludedPatternIds.length > 0) {
+      excludedEntryIds = new Set<string>();
+      const excludedSet = new Set(excludedPatternIds);
+      for (const p of patternAggregation.patterns) {
+        if (excludedSet.has(p.id)) {
+          for (const id of p.entryIds) excludedEntryIds.add(id);
+        }
+      }
+    }
+
+    return { focusedEntryIds, excludedEntryIds };
+  }, [patternAggregation.patterns, focusedPatternId, excludedPatternIds]);
+
   // Apply filtering + optional ±3 lines context expansion
   const { visibleEntries, contextMatchIds } = useMemo(() => {
     const hasFilter =
@@ -351,7 +384,9 @@ export default function App() {
       filters.exclude.trim() !== '' ||
       filters.levels.length > 0 ||
       filters.fieldFilter !== null ||
-      filters.timeBucketRange !== null;
+      filters.timeBucketRange !== null ||
+      patternEntryFilters.focusedEntryIds !== null ||
+      patternEntryFilters.excludedEntryIds !== null;
 
     if (!hasFilter) {
       return { visibleEntries: rawEntries, contextMatchIds: undefined };
@@ -361,6 +396,14 @@ export default function App() {
     const directMatchIds = new Set<string>();
 
     rawEntries.forEach((entry, idx) => {
+      if (patternEntryFilters.focusedEntryIds && !patternEntryFilters.focusedEntryIds.has(entry.id)) {
+        return;
+      }
+
+      if (patternEntryFilters.excludedEntryIds && patternEntryFilters.excludedEntryIds.has(entry.id)) {
+        return;
+      }
+
       if (filters.levels.length > 0 && !filters.levels.includes(entry.level)) {
         return;
       }
@@ -427,7 +470,7 @@ export default function App() {
       visibleEntries: rawEntries.filter((_, idx) => expandedIndexes.has(idx)),
       contextMatchIds: directMatchIds,
     };
-  }, [rawEntries, filters]);
+  }, [rawEntries, filters, patternEntryFilters]);
 
   const selectedEntry = useMemo(
     () => visibleEntries.find((e) => e.id === selectedEntryId) || null,
@@ -606,13 +649,40 @@ export default function App() {
             isLoadingLogs={isLoadingLogs}
             canLiveTail={canLiveTail}
             searchInputRef={searchInputRef}
+            patternPanelOpen={patternPanelOpen}
+            patternCount={patternAggregation.patterns.length}
+            excludedPatternCount={excludedPatternIds.length}
+            focusedPatternActive={focusedPatternId !== null}
+            onTogglePatternPanel={() => {
+              setPatternPanelOpen((open) => {
+                const next = !open;
+                if (next) setSelectedEntryId(null);
+                return next;
+              });
+            }}
+            onClearPatternFilters={() => {
+              setExcludedPatternIds([]);
+              setFocusedPatternId(null);
+            }}
           />
 
           <LogHistogram
             entries={rawEntries}
             activeRange={filters.timeBucketRange}
+            activeLevels={filters.levels}
             onSelectRange={(range) =>
               setFilters((prev) => ({ ...prev, timeBucketRange: range }))
+            }
+            onToggleLevelFilter={(level) =>
+              setFilters((prev) => {
+                const exists = prev.levels.includes(level);
+                return {
+                  ...prev,
+                  levels: exists
+                    ? prev.levels.filter((item) => item !== level)
+                    : [...prev.levels, level],
+                };
+              })
             }
           />
 
@@ -624,42 +694,76 @@ export default function App() {
             isLoading={isLoadingLogs}
             error={logError}
             selectedEntryId={selectedEntryId}
-            onSelectEntry={(entry) =>
-              setSelectedEntryId((curr) => (curr === entry.id ? null : entry.id))
-            }
+            onSelectEntry={(entry) => {
+              setPatternPanelOpen(false);
+              setSelectedEntryId((curr) => (curr === entry.id ? null : entry.id));
+            }}
             isLiveTail={isLiveTail}
-            onResetFilters={() =>
+            onResetFilters={() => {
+              setExcludedPatternIds([]);
+              setFocusedPatternId(null);
               setFilters((prev) => ({
                 ...INITIAL_FILTERS,
                 showTimestamp: prev.showTimestamp,
                 showLineNumbers: prev.showLineNumbers,
                 wrapLines: prev.wrapLines,
                 jsonPreview: prev.jsonPreview,
-              }))
-            }
+              }));
+            }}
             onRetry={loadLogs}
             contextMatchIds={contextMatchIds}
           />
         </main>
 
-        <LogDetailDrawer
-          entry={selectedEntry}
-          onClose={() => setSelectedEntryId(null)}
-          canPrev={selectedEntryIndex > 0}
-          canNext={selectedEntryIndex >= 0 && selectedEntryIndex < visibleEntries.length - 1}
-          onNavigate={(dir) => {
-            if (selectedEntryIndex < 0) return;
-            const nextIdx = dir === 'prev' ? selectedEntryIndex - 1 : selectedEntryIndex + 1;
-            const target = visibleEntries[nextIdx];
-            if (target) setSelectedEntryId(target.id);
-          }}
-          onApplyFieldFilter={(key, value, negate) =>
-            setFilters((prev) => ({
-              ...prev,
-              fieldFilter: { key, value, negate },
-            }))
-          }
-        />
+        {patternPanelOpen ? (
+          <LogPatternPanel
+            patterns={patternAggregation.patterns}
+            totalEntries={patternAggregation.totalEntries}
+            compressionPct={patternAggregation.compressionPct}
+            excludedPatternIds={excludedPatternIds}
+            focusedPatternId={focusedPatternId}
+            onToggleExcludePattern={(id) => {
+              setFocusedPatternId(null);
+              setExcludedPatternIds((prev) =>
+                prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+              );
+            }}
+            onToggleFocusPattern={(id) => {
+              setFocusedPatternId((curr) => (curr === id ? null : id));
+            }}
+            onClearPatternFilters={() => {
+              setExcludedPatternIds([]);
+              setFocusedPatternId(null);
+            }}
+            onApplyRegexToSearch={(regex) => {
+              setFilters((prev) => ({
+                ...prev,
+                search: regex,
+                isRegex: true,
+              }));
+            }}
+            onClose={() => setPatternPanelOpen(false)}
+          />
+        ) : (
+          <LogDetailDrawer
+            entry={selectedEntry}
+            onClose={() => setSelectedEntryId(null)}
+            canPrev={selectedEntryIndex > 0}
+            canNext={selectedEntryIndex >= 0 && selectedEntryIndex < visibleEntries.length - 1}
+            onNavigate={(dir) => {
+              if (selectedEntryIndex < 0) return;
+              const nextIdx = dir === 'prev' ? selectedEntryIndex - 1 : selectedEntryIndex + 1;
+              const target = visibleEntries[nextIdx];
+              if (target) setSelectedEntryId(target.id);
+            }}
+            onApplyFieldFilter={(key, value, negate) =>
+              setFilters((prev) => ({
+                ...prev,
+                fieldFilter: { key, value, negate },
+              }))
+            }
+          />
+        )}
       </div>
 
       <ClusterConnectModal

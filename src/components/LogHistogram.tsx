@@ -1,26 +1,28 @@
-import { X } from 'lucide-react';
-import { useMemo } from 'react';
-import type { LogEntry } from '../types/k8s';
+import { BarChart2, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import type { LogEntry, LogLevel } from '../types/k8s';
 import { formatTimeDisplay } from '../utils/logParser';
+import { type HistogramBucket, HistogramTrendPopover } from './HistogramTrendPopover';
 
 interface LogHistogramProps {
   entries: LogEntry[];
   activeRange: { startMs: number; endMs: number } | null;
+  activeLevels: LogLevel[];
   onSelectRange: (range: { startMs: number; endMs: number } | null) => void;
+  onToggleLevelFilter: (level: LogLevel) => void;
 }
 
-interface Bucket {
-  startMs: number;
-  endMs: number;
-  errorCount: number;
-  warnCount: number;
-  otherCount: number;
-  total: number;
-}
+export function LogHistogram({
+  entries,
+  activeRange,
+  activeLevels,
+  onSelectRange,
+  onToggleLevelFilter,
+}: LogHistogramProps) {
+  const [panelOpen, setPanelOpen] = useState(false);
 
-export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbarHistogramProps) {
   const { buckets, maxTotal } = useMemo(() => {
-    if (entries.length === 0) return { buckets: [] as Bucket[], maxTotal: 0 };
+    if (entries.length === 0) return { buckets: [] as HistogramBucket[], maxTotal: 0 };
 
     let minMs = entries[0].timestampMs;
     let maxMs = entries[0].timestampMs;
@@ -33,12 +35,15 @@ export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbar
     const span = Math.max(maxMs - minMs, bucketCount * 1000);
     const step = span / bucketCount;
 
-    const list: Bucket[] = Array.from({ length: bucketCount }, (_, idx) => ({
+    const list: HistogramBucket[] = Array.from({ length: bucketCount }, (_, idx) => ({
+      index: idx,
       startMs: minMs + idx * step,
       endMs: minMs + (idx + 1) * step,
       errorCount: 0,
       warnCount: 0,
-      otherCount: 0,
+      infoCount: 0,
+      debugCount: 0,
+      unknownCount: 0,
       total: 0,
     }));
 
@@ -50,17 +55,40 @@ export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbar
       b.total += 1;
       if (e.level === 'ERROR') b.errorCount += 1;
       else if (e.level === 'WARN') b.warnCount += 1;
-      else b.otherCount += 1;
+      else if (e.level === 'INFO') b.infoCount += 1;
+      else if (e.level === 'DEBUG') b.debugCount += 1;
+      else b.unknownCount += 1;
     }
 
     const max = Math.max(...list.map((b) => b.total), 1);
     return { buckets: list, maxTotal: max };
   }, [entries]);
 
+  const activeBucket = useMemo(() => {
+    if (!activeRange) return null;
+    return (
+      buckets.find(
+        (b) =>
+          Math.abs(activeRange.startMs - b.startMs) < 1 &&
+          Math.abs(activeRange.endMs - b.endMs) < 1
+      ) || null
+    );
+  }, [buckets, activeRange]);
+
+  useEffect(() => {
+    if (!activeRange) {
+      setPanelOpen(false);
+    }
+  }, [activeRange]);
+
   if (entries.length < 2) return null;
 
+  const anchorPercent = activeBucket
+    ? ((activeBucket.index + 0.5) / buckets.length) * 100
+    : 50;
+
   return (
-    <div className="shrink-0 border-b border-slate-200 dark:border-slate-800/90 bg-slate-50/80 dark:bg-[#0D121C] px-4 py-2">
+    <div className="relative shrink-0 border-b border-slate-200 dark:border-slate-800/90 bg-slate-50/80 dark:bg-[#0D121C] px-4 py-2">
       <div className="flex items-center justify-between gap-4 mb-1.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono">
         <span>
           时间分布 ({formatTimeDisplay(buckets[0].startMs)} – {formatTimeDisplay(buckets[buckets.length - 1].endMs)})
@@ -69,10 +97,23 @@ export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbar
           <span>正常</span>
           <span className="text-amber-600 dark:text-amber-400">WARN</span>
           <span className="text-red-600 dark:text-red-400">ERROR</span>
+          {activeBucket && !panelOpen && (
+            <button
+              type="button"
+              onClick={() => setPanelOpen(true)}
+              className="inline-flex items-center gap-1 text-sky-600 dark:text-sky-400 hover:underline"
+            >
+              <BarChart2 className="w-3 h-3" />
+              <span>趋势分析</span>
+            </button>
+          )}
           {activeRange && (
             <button
               type="button"
-              onClick={() => onSelectRange(null)}
+              onClick={() => {
+                onSelectRange(null);
+                setPanelOpen(false);
+              }}
               className="inline-flex items-center gap-1 text-sky-600 dark:text-sky-400 hover:underline"
             >
               <span>清除时间窗口</span>
@@ -83,25 +124,26 @@ export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbar
       </div>
 
       <div className="h-8 flex items-end gap-[2px]">
-        {buckets.map((bucket, idx) => {
+        {buckets.map((bucket) => {
           const heightPct = bucket.total === 0 ? 0 : Math.max(12, Math.round((bucket.total / maxTotal) * 100));
           const errPct = bucket.total === 0 ? 0 : (bucket.errorCount / bucket.total) * 100;
           const warnPct = bucket.total === 0 ? 0 : (bucket.warnCount / bucket.total) * 100;
           const otherPct = Math.max(0, 100 - errPct - warnPct);
-          const isSelected =
-            activeRange &&
-            Math.abs(activeRange.startMs - bucket.startMs) < 1 &&
-            Math.abs(activeRange.endMs - bucket.endMs) < 1;
+          const isSelected = activeBucket?.index === bucket.index;
 
           return (
             <button
-              key={idx}
+              key={bucket.index}
               type="button"
-              onClick={() =>
-                onSelectRange(
-                  isSelected ? null : { startMs: bucket.startMs, endMs: bucket.endMs }
-                )
-              }
+              onClick={() => {
+                if (isSelected) {
+                  onSelectRange(null);
+                  setPanelOpen(false);
+                } else {
+                  onSelectRange({ startMs: bucket.startMs, endMs: bucket.endMs });
+                  setPanelOpen(true);
+                }
+              }}
               title={`${formatTimeDisplay(bucket.startMs)} - ${formatTimeDisplay(bucket.endMs)}\n总计: ${bucket.total} (ERROR: ${bucket.errorCount}, WARN: ${bucket.warnCount})`}
               className={`flex-1 h-full flex flex-col justify-end rounded-t-[2px] transition-opacity focus:outline-none ${
                 activeRange && !isSelected ? 'opacity-35 hover:opacity-80' : 'opacity-95 hover:opacity-100'
@@ -131,8 +173,27 @@ export function LogHistogram({ entries, activeRange, onSelectRange }: LogToolbar
           );
         })}
       </div>
+
+      {panelOpen && activeBucket && (
+        <HistogramTrendPopover
+          bucket={activeBucket}
+          allBuckets={buckets}
+          allEntries={entries}
+          activeLevels={activeLevels}
+          anchorPercent={anchorPercent}
+          onSelectBucket={(b) => {
+            onSelectRange({ startMs: b.startMs, endMs: b.endMs });
+            setPanelOpen(true);
+          }}
+          onToggleLevelFilter={onToggleLevelFilter}
+          onClearRange={() => {
+            onSelectRange(null);
+            setPanelOpen(false);
+          }}
+          onClosePanel={() => setPanelOpen(false)}
+        />
+      )}
     </div>
   );
 }
 
-type LogToolbarHistogramProps = LogHistogramProps;
