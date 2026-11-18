@@ -72,12 +72,13 @@ export async function parseKubeconfigText(kubeconfig: string): Promise<{
 
 export async function getLocalKubeconfigStatus(): Promise<{
   hasLocalKubeconfig: boolean;
+  kubeconfigReadable: boolean;
   kubeconfigPath: string | null;
   hasInCluster: boolean;
 }> {
   const res = await fetch('/api/k8s/local-status');
   if (!res.ok) {
-    return { hasLocalKubeconfig: false, kubeconfigPath: null, hasInCluster: false };
+    return { hasLocalKubeconfig: false, kubeconfigReadable: false, kubeconfigPath: null, hasInCluster: false };
   }
   return res.json();
 }

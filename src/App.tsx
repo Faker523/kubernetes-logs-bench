@@ -492,6 +492,13 @@ export default function App() {
   const handleConnectK8sCluster = (nextCluster: ClusterConfig) => {
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setMultiPodSelection([]);
+    setSelectedTarget(null);
+    setSelectedEntryId(null);
+    setNamespaces([]);
+    setPods([]);
+    setRawEntries([]);
+    setLogError(null);
     setCluster(nextCluster);
     setSelectedNamespace('__all__');
     loadPodsForCluster(nextCluster, '__all__');

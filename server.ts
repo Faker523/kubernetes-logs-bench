@@ -166,26 +166,39 @@ function parseSimpleKubeconfig(raw: string): {
     return m?.[1]?.trim().replace(/^["']|["']$/g, '');
   };
 
-  const ctxName = getFirstMatch(/current-context:\s*([^\r\n]+)/);
+  const extractB64Field = (field: string): string | undefined => {
+    const re = new RegExp(`${field}:\\s*["']?([A-Za-z0-9+/=_\\-\\s]+?)["']?(?:\\r?\\n|$)`, 'm');
+    const m = raw.match(re);
+    if (!m?.[1]) return undefined;
+    const cleaned = m[1].replace(/\s+/g, '');
+    if (!cleaned) return undefined;
+    try {
+      return Buffer.from(cleaned, 'base64').toString('utf8');
+    } catch {
+      return undefined;
+    }
+  };
+
+  const ctxName = getFirstMatch(/current-context:\s*([^\r\n#]+)/);
   if (ctxName) result.name = ctxName;
 
-  const server = getFirstMatch(/server:\s*(https?:\/\/[^\s\r\n"']+)/);
+  const server = getFirstMatch(/server:\s*["']?(https?:\/\/[^\s\r\n"']+)["']?/);
   if (server) result.apiServer = server;
 
-  const insecure = getFirstMatch(/insecure-skip-tls-verify:\s*(true|false)/i);
+  const insecure = getFirstMatch(/insecure-skip-tls-verify:\s*["']?(true|false)["']?/i);
   if (insecure) result.insecureTls = insecure.toLowerCase() === 'true';
 
   const token = getFirstMatch(/^\s*token:\s*([^\r\n#]+)/m);
   if (token) result.token = token;
 
-  const caB64 = getFirstMatch(/certificate-authority-data:\s*([A-Za-z0-9+/=]+)/);
-  if (caB64) result.caCert = Buffer.from(caB64, 'base64').toString('utf8');
+  const caDecoded = extractB64Field('certificate-authority-data');
+  if (caDecoded) result.caCert = caDecoded;
 
-  const certB64 = getFirstMatch(/client-certificate-data:\s*([A-Za-z0-9+/=]+)/);
-  if (certB64) result.clientCert = Buffer.from(certB64, 'base64').toString('utf8');
+  const certDecoded = extractB64Field('client-certificate-data');
+  if (certDecoded) result.clientCert = certDecoded;
 
-  const keyB64 = getFirstMatch(/client-key-data:\s*([A-Za-z0-9+/=]+)/);
-  if (keyB64) result.clientKey = Buffer.from(keyB64, 'base64').toString('utf8');
+  const keyDecoded = extractB64Field('client-key-data');
+  if (keyDecoded) result.clientKey = keyDecoded;
 
   return result;
 }
@@ -199,9 +212,19 @@ async function startServer() {
     const kubeconfigPath = process.env.KUBECONFIG || path.join(os.homedir(), '.kube', 'config');
     const inClusterToken = '/var/run/secrets/kubernetes.io/serviceaccount/token';
     const hasLocalKubeconfig = fs.existsSync(kubeconfigPath);
+    let kubeconfigReadable = false;
+    if (hasLocalKubeconfig) {
+      try {
+        fs.accessSync(kubeconfigPath, fs.constants.R_OK);
+        kubeconfigReadable = true;
+      } catch {
+        kubeconfigReadable = false;
+      }
+    }
     const hasInCluster = fs.existsSync(inClusterToken);
     res.json({
       hasLocalKubeconfig,
+      kubeconfigReadable,
       kubeconfigPath: hasLocalKubeconfig ? kubeconfigPath : null,
       hasInCluster,
     });
@@ -212,6 +235,14 @@ async function startServer() {
     try {
       const kubeconfigPath = process.env.KUBECONFIG || path.join(os.homedir(), '.kube', 'config');
       if (fs.existsSync(kubeconfigPath)) {
+        try {
+          fs.accessSync(kubeconfigPath, fs.constants.R_OK);
+        } catch {
+          res.status(403).json({
+            error: `无权读取 ${kubeconfigPath}（宿主机 kubeconfig 通常为 0600 权限，容器内 uid=1000 无法读取）。请直接将 kubeconfig 内容粘贴到下方“快速解析”框，或使用 --user $(id -u):$(id -g) 启动容器。`,
+          });
+          return;
+        }
         const raw = fs.readFileSync(kubeconfigPath, 'utf8');
         const parsed = parseSimpleKubeconfig(raw);
         if (!parsed.apiServer) {
@@ -257,7 +288,7 @@ async function startServer() {
     res.json(parsed);
   });
 
-  // Test K8s API connectivity
+  // Test K8s API connectivity and verify authentication
   app.post('/api/k8s/test', async (req, res) => {
     const config = req.body as K8sRequestConfig;
     if (!config?.apiServer) {
@@ -272,6 +303,19 @@ async function startServer() {
         });
         return;
       }
+
+      // Verify authenticated API access (since /version often allows system:anonymous)
+      const nsResp = await k8sRequest(config, '/api/v1/namespaces?limit=1');
+      if (nsResp.status === 401 || nsResp.status === 403) {
+        const isAnon = nsResp.body.includes('system:anonymous');
+        res.status(nsResp.status).json({
+          error: isAnon
+            ? '认证未生效，当前以匿名用户 (system:anonymous) 访问被集群拒绝。请确认已填写 Bearer Token，或已正确解析/配置 mTLS 客户端证书 (Client Cert & Key)。'
+            : `集群鉴权失败 (HTTP ${nsResp.status}): ${nsResp.body.slice(0, 300)}`,
+        });
+        return;
+      }
+
       let versionInfo: Record<string, string> = {};
       try {
         versionInfo = JSON.parse(versionResp.body);

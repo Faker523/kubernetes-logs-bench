@@ -43,6 +43,7 @@ export function ClusterConnectModal({
   const [testSuccess, setTestSuccess] = useState<string | null>(null);
   const [localStatus, setLocalStatus] = useState<{
     hasLocalKubeconfig: boolean;
+    kubeconfigReadable: boolean;
     kubeconfigPath: string | null;
     hasInCluster: boolean;
   } | null>(null);
@@ -64,21 +65,48 @@ export function ClusterConnectModal({
 
   if (!isOpen) return null;
 
+  const applyParsedConfig = (parsed: {
+    name?: string;
+    apiServer?: string;
+    token?: string;
+    caCert?: string;
+    clientCert?: string;
+    clientKey?: string;
+    insecureTls?: boolean;
+  }) => {
+    if (parsed.name) setClusterName(parsed.name);
+    if (parsed.apiServer) setApiServer(parsed.apiServer);
+    setToken(parsed.token || '');
+    setCaCert(parsed.caCert || '');
+    setClientCert(parsed.clientCert || '');
+    setClientKey(parsed.clientKey || '');
+    if (parsed.insecureTls !== undefined) setInsecureTls(parsed.insecureTls);
+    if (parsed.clientCert || parsed.clientKey) {
+      setShowAdvancedTls(true);
+    }
+
+    const authKinds: string[] = [];
+    if (parsed.token) authKinds.push('Bearer Token');
+    if (parsed.clientCert && parsed.clientKey) authKinds.push('mTLS 客户端证书');
+    if (parsed.caCert) authKinds.push('CA 证书');
+
+    if (authKinds.length > 0) {
+      setTestSuccess(`已解析集群地址与凭据 (${authKinds.join(' + ')})，请点击“测试并连接”。`);
+    } else {
+      setTestError('已提取 API Server 地址，但未在 kubeconfig 中找到 token 或 client-certificate-data / client-key-data。');
+    }
+    return parsed;
+  };
+
   const handleParseKubeconfig = async (raw: string) => {
     setTestError(null);
     setTestSuccess(null);
     try {
       const parsed = await parseKubeconfigText(raw);
-      if (parsed.name) setClusterName(parsed.name);
-      if (parsed.apiServer) setApiServer(parsed.apiServer);
-      if (parsed.token) setToken(parsed.token);
-      if (parsed.caCert) setCaCert(parsed.caCert);
-      if (parsed.clientCert) setClientCert(parsed.clientCert);
-      if (parsed.clientKey) setClientKey(parsed.clientKey);
-      if (parsed.insecureTls !== undefined) setInsecureTls(parsed.insecureTls);
-      setTestSuccess('已从 kubeconfig 提取集群地址与凭据，请点击“测试并连接”。');
+      return applyParsedConfig(parsed);
     } catch (err) {
       setTestError(err instanceof Error ? err.message : '解析 kubeconfig 失败');
+      return null;
     }
   };
 
@@ -87,14 +115,7 @@ export function ClusterConnectModal({
     setTestSuccess(null);
     try {
       const parsed = await loadLocalKubeconfig();
-      if (parsed.name) setClusterName(parsed.name);
-      if (parsed.apiServer) setApiServer(parsed.apiServer);
-      if (parsed.token) setToken(parsed.token);
-      if (parsed.caCert) setCaCert(parsed.caCert);
-      if (parsed.clientCert) setClientCert(parsed.clientCert);
-      if (parsed.clientKey) setClientKey(parsed.clientKey);
-      if (parsed.insecureTls !== undefined) setInsecureTls(parsed.insecureTls);
-      setTestSuccess('已读取本地运行环境的 kubeconfig 凭据。');
+      applyParsedConfig(parsed);
     } catch (err) {
       setTestError(err instanceof Error ? err.message : '读取本地配置失败');
     }
@@ -104,19 +125,67 @@ export function ClusterConnectModal({
     e.preventDefault();
     setTestError(null);
     setTestSuccess(null);
-    if (!apiServer.trim()) {
+
+    let effectiveServer = apiServer.trim();
+    let effectiveToken = token.trim();
+    let effectiveCa = caCert.trim();
+    let effectiveCert = clientCert.trim();
+    let effectiveKey = clientKey.trim();
+    let effectiveInsecure = insecureTls;
+    let effectiveName = clusterName.trim();
+
+    // Auto-parse kubeconfig if user pasted it without clicking "解析填充"
+    if (kubeconfigText.trim() && !effectiveToken && (!effectiveCert || !effectiveKey)) {
+      try {
+        const parsed = await parseKubeconfigText(kubeconfigText);
+        if (parsed.name) {
+          effectiveName = parsed.name;
+          setClusterName(parsed.name);
+        }
+        if (parsed.apiServer && !effectiveServer) {
+          effectiveServer = parsed.apiServer;
+          setApiServer(parsed.apiServer);
+        }
+        if (parsed.token) {
+          effectiveToken = parsed.token;
+          setToken(parsed.token);
+        }
+        if (parsed.caCert) {
+          effectiveCa = parsed.caCert;
+          setCaCert(parsed.caCert);
+        }
+        if (parsed.clientCert) {
+          effectiveCert = parsed.clientCert;
+          setClientCert(parsed.clientCert);
+          setShowAdvancedTls(true);
+        }
+        if (parsed.clientKey) {
+          effectiveKey = parsed.clientKey;
+          setClientKey(parsed.clientKey);
+          setShowAdvancedTls(true);
+        }
+        if (parsed.insecureTls !== undefined) {
+          effectiveInsecure = parsed.insecureTls;
+          setInsecureTls(parsed.insecureTls);
+        }
+      } catch {
+        // Proceed with manual fields if kubeconfig snippet is partial
+      }
+    }
+
+    if (!effectiveServer) {
       setTestError('请填写 Kubernetes API Server 地址');
       return;
     }
     setTesting(true);
     try {
       const result = await testK8sConnection({
-        apiServer: apiServer.trim(),
-        token: token.trim() || undefined,
-        caCert: caCert.trim() || undefined,
-        clientCert: clientCert.trim() || undefined,
-        clientKey: clientKey.trim() || undefined,
-        insecureTls,
+        apiServer: effectiveServer,
+        token: effectiveToken || undefined,
+        caCert: effectiveCa || undefined,
+        clientCert: effectiveCert || undefined,
+        clientKey: effectiveKey || undefined,
+        insecureTls: effectiveInsecure,
       });
 
       if (!result.ok) {
@@ -127,14 +196,14 @@ export function ClusterConnectModal({
 
       onConnectK8sCluster({
         id: `k8s-${Date.now()}`,
-        name: clusterName.trim() || 'k8s-cluster',
+        name: effectiveName || 'k8s-cluster',
         mode: 'k8s-api',
-        apiServer: apiServer.trim(),
-        token: token.trim() || undefined,
-        caCert: caCert.trim() || undefined,
-        clientCert: clientCert.trim() || undefined,
-        clientKey: clientKey.trim() || undefined,
-        insecureTls,
+        apiServer: effectiveServer,
+        token: effectiveToken || undefined,
+        caCert: effectiveCa || undefined,
+        clientCert: effectiveCert || undefined,
+        clientKey: effectiveKey || undefined,
+        insecureTls: effectiveInsecure,
         gitVersion: result.gitVersion,
       });
       onClose();
@@ -236,18 +305,29 @@ export function ClusterConnectModal({
           {tab === 'k8s' && (
             <form onSubmit={handleConnectK8s} className="space-y-4">
               {(localStatus?.hasLocalKubeconfig || localStatus?.hasInCluster) && (
-                <div className="p-3 rounded-md border border-sky-200 dark:border-sky-900/60 bg-sky-50 dark:bg-sky-950/25 flex items-center justify-between gap-3">
-                  <div className="text-xs text-sky-800 dark:text-sky-200">
-                    检测到当前运行环境存在 {localStatus.hasLocalKubeconfig ? `本地 kubeconfig (${localStatus.kubeconfigPath})` : 'In-Cluster ServiceAccount 凭据'}
+                localStatus.hasLocalKubeconfig && !localStatus.kubeconfigReadable ? (
+                  <div className="p-3 rounded-md border border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/25 text-xs text-amber-800 dark:text-amber-200 space-y-1">
+                    <div className="font-medium">
+                      检测到本地 kubeconfig ({localStatus.kubeconfigPath})，但容器当前用户 (uid=1000) 无读取权限
+                    </div>
+                    <div className="text-[11px] opacity-90">
+                      宿主机文件通常为 0600 权限。您可以直接在下方粘贴 kubeconfig 内容，或在启动容器时添加 <code className="font-mono">--user $(id -u):$(id -g)</code>。
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleLoadLocalConfig}
-                    className="h-8 px-3 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white whitespace-nowrap shrink-0"
-                  >
-                    一键载入
-                  </button>
-                </div>
+                ) : (
+                  <div className="p-3 rounded-md border border-sky-200 dark:border-sky-900/60 bg-sky-50 dark:bg-sky-950/25 flex items-center justify-between gap-3">
+                    <div className="text-xs text-sky-800 dark:text-sky-200">
+                      检测到当前运行环境存在 {localStatus.hasLocalKubeconfig ? `本地 kubeconfig (${localStatus.kubeconfigPath})` : 'In-Cluster ServiceAccount 凭据'}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleLoadLocalConfig}
+                      className="h-8 px-3 rounded bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white whitespace-nowrap shrink-0"
+                    >
+                      一键载入
+                    </button>
+                  </div>
+                )
               )}
 
               {/* Quick Kubeconfig Paste */}
@@ -279,7 +359,10 @@ export function ClusterConnectModal({
                   <textarea
                     rows={2}
                     value={kubeconfigText}
-                    onChange={(e) => setKubeconfigText(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setKubeconfigText(val);
+                    }}
                     placeholder="粘贴 kubeconfig YAML/JSON 内容可自动提取 server、token 与证书..."
                     className="flex-1 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] p-2.5 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500"
                   />
@@ -314,7 +397,6 @@ export function ClusterConnectModal({
                   </label>
                   <input
                     type="url"
-                    required
                     value={apiServer}
                     onChange={(e) => setApiServer(e.target.value)}
                     placeholder="https://10.0.0.10:6443"
