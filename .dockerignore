@@ -1,0 +1,14 @@
+node_modules
+dist
+build
+coverage
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+*.mjs
+.DS_Store
+doc
+README.md
