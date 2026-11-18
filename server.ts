@@ -24,6 +24,39 @@ interface K8sHttpResponse {
   headers: http.IncomingHttpHeaders;
 }
 
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+const httpsAgentCache = new Map<string, https.Agent>();
+
+function getHttpsAgent(config: K8sRequestConfig): https.Agent {
+  const key = `${Boolean(config.insecureTls)}|${config.caCert?.trim() || ''}|${config.clientCert?.trim() || ''}|${config.clientKey?.trim() || ''}`;
+  const existing = httpsAgentCache.get(key);
+  if (existing) return existing;
+
+  if (httpsAgentCache.size >= 20) {
+    const oldestKey = httpsAgentCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      httpsAgentCache.get(oldestKey)?.destroy();
+      httpsAgentCache.delete(oldestKey);
+    }
+  }
+
+  const agentOptions: https.AgentOptions = {
+    keepAlive: true,
+    maxSockets: 16,
+    rejectUnauthorized: !config.insecureTls,
+  };
+  if (config.caCert?.trim()) {
+    agentOptions.ca = config.caCert.trim();
+  }
+  if (config.clientCert?.trim() && config.clientKey?.trim()) {
+    agentOptions.cert = config.clientCert.trim();
+    agentOptions.key = config.clientKey.trim();
+  }
+  const agent = new https.Agent(agentOptions);
+  httpsAgentCache.set(key, agent);
+  return agent;
+}
+
 function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpResponse> {
   return new Promise((resolve, reject) => {
     let targetUrl: URL;
@@ -49,7 +82,8 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
       path: `${targetUrl.pathname}${targetUrl.search}`,
       method: 'GET',
       headers,
-      timeout: 15000,
+      timeout: 30000,
+      agent: isHttps ? getHttpsAgent(config) : keepAliveHttpAgent,
     };
 
     if (isHttps) {
@@ -77,7 +111,7 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
     });
 
     req.on('timeout', () => {
-      req.destroy(new Error('连接 Kubernetes API Server 超时 (15s)'));
+      req.destroy(new Error('连接 Kubernetes API Server 超时 (30s)'));
     });
 
     req.on('error', (err) => {
@@ -109,7 +143,57 @@ function extractConfigFromHeaders(req: express.Request): K8sRequestConfig | null
   };
 }
 
-function parseSimpleKubeconfig(raw: string): {
+function formatK8sError(status: number, body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { kind?: string; message?: string; reason?: string };
+    if (parsed?.kind === 'Status' && parsed.message) {
+      return `HTTP ${status} (${parsed.reason || 'Error'}): ${parsed.message}`;
+    }
+  } catch {
+    // Not JSON Status
+  }
+  return body.slice(0, 600);
+}
+
+function splitYamlListItems(sectionText: string): Array<{ name?: string; body: string }> {
+  const lines = sectionText.split(/\r?\n/);
+  const items: Array<{ name?: string; body: string }> = [];
+  let currentLines: string[] = [];
+  let baseIndent = -1;
+
+  for (const line of lines) {
+    if (!line.trim() || line.trimStart().startsWith('#')) {
+      if (currentLines.length > 0) currentLines.push(line);
+      continue;
+    }
+    const itemMatch = line.match(/^(\s*)-\s+(.*)$/);
+    if (itemMatch && (baseIndent === -1 || itemMatch[1].length <= baseIndent)) {
+      if (currentLines.length > 0) {
+        const body = currentLines.join('\n');
+        const nameMatch = body.match(/(?:^|\n)\s*-?\s*name:\s*["']?([^"'\r\n#]+)["']?/);
+        items.push({ name: nameMatch?.[1]?.trim(), body });
+      }
+      baseIndent = itemMatch[1].length;
+      currentLines = [line];
+    } else if (currentLines.length > 0) {
+      currentLines.push(line);
+    }
+  }
+  if (currentLines.length > 0) {
+    const body = currentLines.join('\n');
+    const nameMatch = body.match(/(?:^|\n)\s*-?\s*name:\s*["']?([^"'\r\n#]+)["']?/);
+    items.push({ name: nameMatch?.[1]?.trim(), body });
+  }
+  return items;
+}
+
+function extractYamlSection(raw: string, sectionName: string): string {
+  const re = new RegExp(`^${sectionName}:\\s*\\r?\\n([\\s\\S]*?)(?=^[a-zA-Z0-9_-]+:|(?![\\s\\S]))`, 'm');
+  const m = raw.match(re);
+  return m?.[1] || '';
+}
+
+function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
   name?: string;
   apiServer?: string;
   token?: string;
@@ -128,6 +212,21 @@ function parseSimpleKubeconfig(raw: string): {
     insecureTls?: boolean;
   } = {};
 
+  const readFileIfAllowed = (filePath?: string): string | undefined => {
+    if (!resolveLocalFiles || !filePath) return undefined;
+    const resolved = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(path.dirname(process.env.KUBECONFIG || path.join(os.homedir(), '.kube', 'config')), filePath);
+    try {
+      if (fs.existsSync(resolved)) {
+        return fs.readFileSync(resolved, 'utf8');
+      }
+    } catch {
+      // Ignore unreadable file
+    }
+    return undefined;
+  };
+
   // Handle JSON kubeconfig cleanly
   const trimmed = raw.trim();
   if (trimmed.startsWith('{')) {
@@ -145,30 +244,38 @@ function parseSimpleKubeconfig(raw: string): {
       result.insecureTls = Boolean(cluster?.cluster?.['insecure-skip-tls-verify']);
       if (cluster?.cluster?.['certificate-authority-data']) {
         result.caCert = Buffer.from(cluster.cluster['certificate-authority-data'], 'base64').toString('utf8');
+      } else if (cluster?.cluster?.['certificate-authority']) {
+        result.caCert = readFileIfAllowed(cluster.cluster['certificate-authority']);
       }
       if (user?.user?.token) {
         result.token = user.user.token;
+      } else if (user?.user?.tokenFile) {
+        result.token = readFileIfAllowed(user.user.tokenFile)?.trim();
       }
       if (user?.user?.['client-certificate-data']) {
         result.clientCert = Buffer.from(user.user['client-certificate-data'], 'base64').toString('utf8');
+      } else if (user?.user?.['client-certificate']) {
+        result.clientCert = readFileIfAllowed(user.user['client-certificate']);
       }
       if (user?.user?.['client-key-data']) {
         result.clientKey = Buffer.from(user.user['client-key-data'], 'base64').toString('utf8');
+      } else if (user?.user?.['client-key']) {
+        result.clientKey = readFileIfAllowed(user.user['client-key']);
       }
       return result;
     } catch {
-      // Fall through to YAML line extraction
+      // Fall through to YAML extraction
     }
   }
 
-  const getFirstMatch = (regex: RegExp) => {
-    const m = raw.match(regex);
+  const getField = (source: string, regex: RegExp) => {
+    const m = source.match(regex);
     return m?.[1]?.trim().replace(/^["']|["']$/g, '');
   };
 
-  const extractB64Field = (field: string): string | undefined => {
+  const extractB64Field = (source: string, field: string): string | undefined => {
     const re = new RegExp(`${field}:\\s*["']?([A-Za-z0-9+/=_\\-\\s]+?)["']?(?:\\r?\\n|$)`, 'm');
-    const m = raw.match(re);
+    const m = source.match(re);
     if (!m?.[1]) return undefined;
     const cleaned = m[1].replace(/\s+/g, '');
     if (!cleaned) return undefined;
@@ -179,26 +286,68 @@ function parseSimpleKubeconfig(raw: string): {
     }
   };
 
-  const ctxName = getFirstMatch(/current-context:\s*([^\r\n#]+)/);
-  if (ctxName) result.name = ctxName;
+  const currentCtxName = getField(raw, /^current-context:\s*([^\r\n#]+)/m);
+  const contexts = splitYamlListItems(extractYamlSection(raw, 'contexts'));
+  const clusters = splitYamlListItems(extractYamlSection(raw, 'clusters'));
+  const users = splitYamlListItems(extractYamlSection(raw, 'users'));
 
-  const server = getFirstMatch(/server:\s*["']?(https?:\/\/[^\s\r\n"']+)["']?/);
+  const activeCtx =
+    (currentCtxName ? contexts.find((c) => c.name === currentCtxName) : undefined) || contexts[0];
+  const targetClusterName = activeCtx ? getField(activeCtx.body, /^\s*cluster:\s*([^\r\n#]+)/m) : undefined;
+  const targetUserName = activeCtx ? getField(activeCtx.body, /^\s*user:\s*([^\r\n#]+)/m) : undefined;
+
+  const activeCluster =
+    (targetClusterName ? clusters.find((c) => c.name === targetClusterName) : undefined) || clusters[0];
+  const activeUser =
+    (targetUserName ? users.find((u) => u.name === targetUserName) : undefined) || users[0];
+
+  const clusterScope = activeCluster?.body || raw;
+  const userScope = activeUser?.body || raw;
+
+  if (currentCtxName) result.name = currentCtxName;
+  else if (activeCluster?.name) result.name = activeCluster.name;
+
+  const server = getField(clusterScope, /server:\s*["']?(https?:\/\/[^\s\r\n"']+)["']?/);
   if (server) result.apiServer = server;
 
-  const insecure = getFirstMatch(/insecure-skip-tls-verify:\s*["']?(true|false)["']?/i);
+  const insecure = getField(clusterScope, /insecure-skip-tls-verify:\s*["']?(true|false)["']?/i);
   if (insecure) result.insecureTls = insecure.toLowerCase() === 'true';
 
-  const token = getFirstMatch(/^\s*token:\s*([^\r\n#]+)/m);
-  if (token) result.token = token;
+  const token = getField(userScope, /^\s*token:\s*([^\r\n#]+)/m);
+  if (token) {
+    result.token = token;
+  } else {
+    const tokenFile = getField(userScope, /^\s*tokenFile:\s*([^\r\n#]+)/m);
+    const loadedToken = readFileIfAllowed(tokenFile)?.trim();
+    if (loadedToken) result.token = loadedToken;
+  }
 
-  const caDecoded = extractB64Field('certificate-authority-data');
-  if (caDecoded) result.caCert = caDecoded;
+  const caDecoded = extractB64Field(clusterScope, 'certificate-authority-data');
+  if (caDecoded) {
+    result.caCert = caDecoded;
+  } else {
+    const caPath = getField(clusterScope, /^\s*certificate-authority:\s*([^\r\n#]+)/m);
+    const loadedCa = readFileIfAllowed(caPath);
+    if (loadedCa) result.caCert = loadedCa;
+  }
 
-  const certDecoded = extractB64Field('client-certificate-data');
-  if (certDecoded) result.clientCert = certDecoded;
+  const certDecoded = extractB64Field(userScope, 'client-certificate-data');
+  if (certDecoded) {
+    result.clientCert = certDecoded;
+  } else {
+    const certPath = getField(userScope, /^\s*client-certificate:\s*([^\r\n#]+)/m);
+    const loadedCert = readFileIfAllowed(certPath);
+    if (loadedCert) result.clientCert = loadedCert;
+  }
 
-  const keyDecoded = extractB64Field('client-key-data');
-  if (keyDecoded) result.clientKey = keyDecoded;
+  const keyDecoded = extractB64Field(userScope, 'client-key-data');
+  if (keyDecoded) {
+    result.clientKey = keyDecoded;
+  } else {
+    const keyPath = getField(userScope, /^\s*client-key:\s*([^\r\n#]+)/m);
+    const loadedKey = readFileIfAllowed(keyPath);
+    if (loadedKey) result.clientKey = loadedKey;
+  }
 
   return result;
 }
@@ -244,7 +393,7 @@ async function startServer() {
           return;
         }
         const raw = fs.readFileSync(kubeconfigPath, 'utf8');
-        const parsed = parseSimpleKubeconfig(raw);
+        const parsed = parseSimpleKubeconfig(raw, true);
         if (!parsed.apiServer) {
           res.status(400).json({ error: '未能从本地 kubeconfig 解析到有效的 server 地址' });
           return;
@@ -306,12 +455,12 @@ async function startServer() {
 
       // Verify authenticated API access (since /version often allows system:anonymous)
       const nsResp = await k8sRequest(config, '/api/v1/namespaces?limit=1');
-      if (nsResp.status === 401 || nsResp.status === 403) {
+      if (nsResp.status === 401 || (nsResp.status === 403 && nsResp.body.includes('system:anonymous'))) {
         const isAnon = nsResp.body.includes('system:anonymous');
         res.status(nsResp.status).json({
           error: isAnon
             ? '认证未生效，当前以匿名用户 (system:anonymous) 访问被集群拒绝。请确认已填写 Bearer Token，或已正确解析/配置 mTLS 客户端证书 (Client Cert & Key)。'
-            : `集群鉴权失败 (HTTP ${nsResp.status}): ${nsResp.body.slice(0, 300)}`,
+            : `集群鉴权失败: ${formatK8sError(nsResp.status, nsResp.body)}`,
         });
         return;
       }
@@ -344,18 +493,21 @@ async function startServer() {
     try {
       const resp = await k8sRequest(config, '/api/v1/namespaces');
       if (resp.status >= 400) {
-        res.status(resp.status).json({ error: resp.body.slice(0, 400) });
+        res.status(resp.status).json({ error: formatK8sError(resp.status, resp.body) });
         return;
       }
       const data = JSON.parse(resp.body) as { items?: Array<{ metadata?: { name?: string } }> };
-      const namespaces = (data.items || []).map((item) => item.metadata?.name).filter(Boolean);
+      const namespaces = (data.items || [])
+        .map((item) => item.metadata?.name)
+        .filter((name): name is string => Boolean(name))
+        .sort((a, b) => a.localeCompare(b));
       res.json({ namespaces });
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '获取命名空间失败' });
     }
   });
 
-  // List Pods
+  // List Pods (with pagination & RBAC per-namespace fallback for __all__)
   app.get('/api/k8s/pods', async (req, res) => {
     const config = extractConfigFromHeaders(req);
     if (!config) {
@@ -363,88 +515,177 @@ async function startServer() {
       return;
     }
     const namespace = typeof req.query.namespace === 'string' ? req.query.namespace : '';
-    const apiPath = namespace && namespace !== '__all__'
-      ? `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`
-      : '/api/v1/pods';
+    const isAllNamespaces = !namespace || namespace === '__all__';
+    const baseApiPath = isAllNamespaces
+      ? '/api/v1/pods'
+      : `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
+
+    interface RawPodItem {
+      metadata?: { name?: string; namespace?: string; creationTimestamp?: string; labels?: Record<string, string> };
+      spec?: { nodeName?: string; containers?: Array<{ name: string; image?: string }>; initContainers?: Array<{ name: string; image?: string }> };
+      status?: {
+        phase?: string;
+        podIP?: string;
+        containerStatuses?: Array<{ name: string; ready?: boolean; restartCount?: number; state?: Record<string, { reason?: string }> }>;
+        initContainerStatuses?: Array<{ name: string; ready?: boolean; restartCount?: number; state?: Record<string, { reason?: string }> }>;
+      };
+    }
+
+    interface PodListPayload {
+      metadata?: { continue?: string };
+      items?: RawPodItem[];
+    }
+
+    const fetchPaginatedPods = async (
+      apiPath: string
+    ): Promise<{ ok: true; items: RawPodItem[] } | { ok: false; status: number; body: string }> => {
+      const allItems: RawPodItem[] = [];
+      let continueToken = '';
+      let page = 0;
+
+      while (page < 40) {
+        page += 1;
+        const qs = new URLSearchParams({ limit: '500' });
+        if (continueToken) qs.set('continue', continueToken);
+        const resp = await k8sRequest(config, `${apiPath}?${qs.toString()}`);
+
+        if (resp.status === 410 && continueToken) {
+          // Continue token expired mid-pagination; fall back to unpaginated single call
+          const fallbackResp = await k8sRequest(config, apiPath);
+          if (fallbackResp.status >= 400) {
+            return { ok: false, status: fallbackResp.status, body: fallbackResp.body };
+          }
+          const fallbackData = JSON.parse(fallbackResp.body) as PodListPayload;
+          return { ok: true, items: fallbackData.items || [] };
+        }
+
+        if (resp.status >= 400) {
+          return { ok: false, status: resp.status, body: resp.body };
+        }
+
+        const data = JSON.parse(resp.body) as PodListPayload;
+        if (Array.isArray(data.items)) {
+          allItems.push(...data.items);
+        }
+
+        const nextContinue = data.metadata?.continue;
+        if (!nextContinue) break;
+        continueToken = nextContinue;
+      }
+
+      return { ok: true, items: allItems };
+    };
 
     try {
-      const resp = await k8sRequest(config, apiPath);
-      if (resp.status >= 400) {
-        res.status(resp.status).json({ error: resp.body.slice(0, 400) });
+      let result = await fetchPaginatedPods(baseApiPath);
+
+      // If cluster-wide /api/v1/pods is forbidden by RBAC, try listing per-namespace
+      if (!result.ok && result.status === 403 && isAllNamespaces) {
+        const nsResp = await k8sRequest(config, '/api/v1/namespaces');
+        if (nsResp.status < 400) {
+          const nsData = JSON.parse(nsResp.body) as { items?: Array<{ metadata?: { name?: string } }> };
+          const nsNames = (nsData.items || [])
+            .map((item) => item.metadata?.name)
+            .filter((name): name is string => Boolean(name));
+
+          if (nsNames.length > 0) {
+            const collected: RawPodItem[] = [];
+            const concurrency = 8;
+            for (let i = 0; i < nsNames.length; i += concurrency) {
+              const batch = nsNames.slice(i, i + concurrency);
+              const batchResults = await Promise.all(
+                batch.map((nsName) =>
+                  fetchPaginatedPods(`/api/v1/namespaces/${encodeURIComponent(nsName)}/pods`).catch(() => ({
+                    ok: false as const,
+                    status: 500,
+                    body: '',
+                  }))
+                )
+              );
+              for (const r of batchResults) {
+                if (r.ok) collected.push(...r.items);
+              }
+            }
+            if (collected.length > 0) {
+              result = { ok: true, items: collected };
+            }
+          }
+        }
+      }
+
+      if (!result.ok) {
+        res.status(result.status).json({ error: formatK8sError(result.status, result.body) });
         return;
       }
-      const data = JSON.parse(resp.body) as {
-        items?: Array<{
-          metadata?: { name?: string; namespace?: string; creationTimestamp?: string; labels?: Record<string, string> };
-          spec?: { nodeName?: string; containers?: Array<{ name: string; image?: string }>; initContainers?: Array<{ name: string; image?: string }> };
-          status?: {
-            phase?: string;
-            podIP?: string;
-            containerStatuses?: Array<{ name: string; ready?: boolean; restartCount?: number; state?: Record<string, { reason?: string }> }>;
-            initContainerStatuses?: Array<{ name: string; ready?: boolean; restartCount?: number; state?: Record<string, { reason?: string }> }>;
+
+      const dedupedMap = new Map<string, RawPodItem>();
+      for (const item of result.items) {
+        const ns = item.metadata?.namespace || 'default';
+        const name = item.metadata?.name || 'unknown';
+        dedupedMap.set(`${ns}/${name}`, item);
+      }
+
+      const pods = Array.from(dedupedMap.values())
+        .map((item) => {
+          const statusMap = new Map<string, { ready: boolean; restarts: number; stateReason?: string }>();
+          for (const cs of item.status?.containerStatuses || []) {
+            const reason = cs.state?.waiting?.reason || cs.state?.terminated?.reason || (cs.state?.running ? 'Running' : undefined);
+            statusMap.set(cs.name, {
+              ready: Boolean(cs.ready),
+              restarts: cs.restartCount ?? 0,
+              stateReason: reason,
+            });
+          }
+          for (const cs of item.status?.initContainerStatuses || []) {
+            const reason = cs.state?.waiting?.reason || cs.state?.terminated?.reason || (cs.state?.running ? 'Running' : undefined);
+            statusMap.set(cs.name, {
+              ready: Boolean(cs.ready),
+              restarts: cs.restartCount ?? 0,
+              stateReason: reason,
+            });
+          }
+
+          const containers = [
+            ...(item.spec?.containers || []).map((c) => {
+              const st = statusMap.get(c.name);
+              return {
+                name: c.name,
+                image: c.image || '',
+                isInit: false,
+                ready: st?.ready ?? false,
+                restarts: st?.restarts ?? 0,
+                state: st?.stateReason || 'Unknown',
+              };
+            }),
+            ...(item.spec?.initContainers || []).map((c) => {
+              const st = statusMap.get(c.name);
+              return {
+                name: c.name,
+                image: c.image || '',
+                isInit: true,
+                ready: st?.ready ?? false,
+                restarts: st?.restarts ?? 0,
+                state: st?.stateReason || 'Initialized',
+              };
+            }),
+          ];
+
+          const waitingReason = item.status?.containerStatuses?.find((c) => c.state?.waiting?.reason)?.state?.waiting?.reason;
+          const totalRestarts = containers.reduce((acc, c) => acc + c.restarts, 0);
+
+          return {
+            name: item.metadata?.name || 'unknown',
+            namespace: item.metadata?.namespace || 'default',
+            nodeName: item.spec?.nodeName || '-',
+            podIP: item.status?.podIP || '-',
+            phase: waitingReason || item.status?.phase || 'Unknown',
+            restarts: totalRestarts,
+            createdAt: item.metadata?.creationTimestamp || '',
+            labels: item.metadata?.labels || {},
+            containers,
           };
-        }>;
-      };
-
-      const pods = (data.items || []).map((item) => {
-        const statusMap = new Map<string, { ready: boolean; restarts: number; stateReason?: string }>();
-        for (const cs of item.status?.containerStatuses || []) {
-          const reason = cs.state?.waiting?.reason || cs.state?.terminated?.reason || (cs.state?.running ? 'Running' : undefined);
-          statusMap.set(cs.name, {
-            ready: Boolean(cs.ready),
-            restarts: cs.restartCount ?? 0,
-            stateReason: reason,
-          });
-        }
-        for (const cs of item.status?.initContainerStatuses || []) {
-          const reason = cs.state?.waiting?.reason || cs.state?.terminated?.reason || (cs.state?.running ? 'Running' : undefined);
-          statusMap.set(cs.name, {
-            ready: Boolean(cs.ready),
-            restarts: cs.restartCount ?? 0,
-            stateReason: reason,
-          });
-        }
-
-        const containers = [
-          ...(item.spec?.containers || []).map((c) => {
-            const st = statusMap.get(c.name);
-            return {
-              name: c.name,
-              image: c.image || '',
-              isInit: false,
-              ready: st?.ready ?? false,
-              restarts: st?.restarts ?? 0,
-              state: st?.stateReason || 'Unknown',
-            };
-          }),
-          ...(item.spec?.initContainers || []).map((c) => {
-            const st = statusMap.get(c.name);
-            return {
-              name: c.name,
-              image: c.image || '',
-              isInit: true,
-              ready: st?.ready ?? false,
-              restarts: st?.restarts ?? 0,
-              state: st?.stateReason || 'Initialized',
-            };
-          }),
-        ];
-
-        const waitingReason = item.status?.containerStatuses?.find((c) => c.state?.waiting?.reason)?.state?.waiting?.reason;
-        const totalRestarts = containers.reduce((acc, c) => acc + c.restarts, 0);
-
-        return {
-          name: item.metadata?.name || 'unknown',
-          namespace: item.metadata?.namespace || 'default',
-          nodeName: item.spec?.nodeName || '-',
-          podIP: item.status?.podIP || '-',
-          phase: waitingReason || item.status?.phase || 'Unknown',
-          restarts: totalRestarts,
-          createdAt: item.metadata?.creationTimestamp || '',
-          labels: item.metadata?.labels || {},
-          containers,
-        };
-      });
+        })
+        .sort((a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name));
 
       res.json({ pods });
     } catch (err) {
@@ -484,7 +725,7 @@ async function startServer() {
     try {
       const resp = await k8sRequest(config, apiPath);
       if (resp.status >= 400) {
-        res.status(resp.status).json({ error: resp.body.slice(0, 400) });
+        res.status(resp.status).json({ error: formatK8sError(resp.status, resp.body) });
         return;
       }
       res.json({ raw: resp.body });

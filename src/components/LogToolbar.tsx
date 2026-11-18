@@ -39,6 +39,15 @@ export function LogToolbar({
 }: LogToolbarProps) {
   const excludeInputRef = useRef<HTMLInputElement>(null);
 
+  let isInvalidRegex = false;
+  if (filters.isRegex && filters.search.trim()) {
+    try {
+      new RegExp(filters.search);
+    } catch {
+      isInvalidRegex = true;
+    }
+  }
+
   const toggleLevel = (lvl: LogLevel) => {
     const exists = filters.levels.includes(lvl);
     const next = exists
@@ -52,7 +61,14 @@ export function LogToolbar({
       {/* Row 1: Search, Exclude, Live Tail */}
       <div className="flex flex-wrap items-center gap-2.5">
         {/* Search Input with Regex & Case toggles */}
-        <div className="flex-1 min-w-[260px] flex items-center h-9 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#131926] focus-within:ring-2 focus-within:ring-sky-500 px-2.5 gap-1.5">
+        <div
+          title={isInvalidRegex ? '正则表达式语法有误' : undefined}
+          className={`flex-1 min-w-[260px] flex items-center h-9 rounded-md border bg-slate-50 dark:bg-[#131926] focus-within:ring-2 px-2.5 gap-1.5 ${
+            isInvalidRegex
+              ? 'border-red-400 dark:border-red-700 focus-within:ring-red-500'
+              : 'border-slate-200 dark:border-slate-800 focus-within:ring-sky-500'
+          }`}
+        >
           <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
           <input
             ref={searchInputRef}
@@ -62,6 +78,11 @@ export function LogToolbar({
             placeholder={filters.isRegex ? '输入正则表达式过滤日志 (快捷键 /)...' : '搜索日志关键词、Trace ID、状态码 (快捷键 /)...'}
             className="flex-1 min-w-0 bg-transparent text-xs font-mono text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none"
           />
+          {isInvalidRegex && (
+            <span className="text-[10px] font-mono text-red-600 dark:text-red-400 whitespace-nowrap shrink-0">
+              正则无效
+            </span>
+          )}
           {filters.search && (
             <button
               type="button"

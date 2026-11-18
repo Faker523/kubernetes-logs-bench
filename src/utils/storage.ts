@@ -105,14 +105,29 @@ export function saveSelectedNamespace(ns: string): void {
   }
 }
 
-export function loadSelectedTarget(): SelectedTarget | null {
-  const t = safeGetJson<SelectedTarget>(KEYS.selectedTarget);
+interface PersistedTarget {
+  clusterId: string;
+  target: SelectedTarget;
+}
+
+export function loadSelectedTarget(clusterId: string): SelectedTarget | null {
+  const saved = safeGetJson<PersistedTarget | SelectedTarget>(KEYS.selectedTarget);
+  if (!saved || typeof saved !== 'object') return null;
+  if (!('clusterId' in saved) || !('target' in saved)) {
+    return null;
+  }
+  if (saved.clusterId !== clusterId) return null;
+  const t = saved.target;
   if (!t || !t.pod || !t.namespace) return null;
   return t;
 }
 
-export function saveSelectedTarget(target: SelectedTarget | null): void {
-  safeSetJson(KEYS.selectedTarget, target);
+export function saveSelectedTarget(clusterId: string, target: SelectedTarget | null): void {
+  if (!target) {
+    safeSetJson(KEYS.selectedTarget, null);
+    return;
+  }
+  safeSetJson(KEYS.selectedTarget, { clusterId, target } satisfies PersistedTarget);
 }
 
 export function loadDisplayPrefs(): Partial<DisplayPrefs> {

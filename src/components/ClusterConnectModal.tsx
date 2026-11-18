@@ -41,6 +41,7 @@ export function ClusterConnectModal({
   const [insecureTls, setInsecureTls] = useState(activeCluster.insecureTls ?? true);
   const [rememberConnection, setRememberConnection] = useState(true);
   const [kubeconfigText, setKubeconfigText] = useState('');
+  const [kubeconfigDirty, setKubeconfigDirty] = useState(false);
   const [showAdvancedTls, setShowAdvancedTls] = useState(false);
 
   const [testing, setTesting] = useState(false);
@@ -63,10 +64,24 @@ export function ClusterConnectModal({
 
   useEffect(() => {
     if (!isOpen) return;
+    setTestError(null);
+    setTestSuccess(null);
+    setImportError(null);
+    setKubeconfigDirty(false);
+    if (activeCluster.mode === 'k8s-api') {
+      setClusterName(activeCluster.name);
+      setApiServer(activeCluster.apiServer || '');
+      setToken(activeCluster.token || '');
+      setCaCert(activeCluster.caCert || '');
+      setClientCert(activeCluster.clientCert || '');
+      setClientKey(activeCluster.clientKey || '');
+      setInsecureTls(activeCluster.insecureTls ?? true);
+      setShowAdvancedTls(Boolean(activeCluster.caCert || activeCluster.clientCert || activeCluster.clientKey));
+    }
     getLocalKubeconfigStatus()
       .then(setLocalStatus)
       .catch(() => setLocalStatus(null));
-  }, [isOpen]);
+  }, [isOpen, activeCluster]);
 
   if (!isOpen) return null;
 
@@ -89,6 +104,7 @@ export function ClusterConnectModal({
     if (parsed.clientCert || parsed.clientKey) {
       setShowAdvancedTls(true);
     }
+    setKubeconfigDirty(false);
 
     const authKinds: string[] = [];
     if (parsed.token) authKinds.push('Bearer Token');
@@ -139,15 +155,18 @@ export function ClusterConnectModal({
     let effectiveInsecure = insecureTls;
     let effectiveName = clusterName.trim();
 
-    // Auto-parse kubeconfig if user pasted it without clicking "解析填充"
-    if (kubeconfigText.trim() && !effectiveToken && (!effectiveCert || !effectiveKey)) {
+    // Auto-parse kubeconfig if user pasted/edited it without clicking "解析填充"
+    if (
+      kubeconfigText.trim() &&
+      (kubeconfigDirty || (!effectiveToken && (!effectiveCert || !effectiveKey)))
+    ) {
       try {
         const parsed = await parseKubeconfigText(kubeconfigText);
         if (parsed.name) {
           effectiveName = parsed.name;
           setClusterName(parsed.name);
         }
-        if (parsed.apiServer && !effectiveServer) {
+        if (parsed.apiServer && (kubeconfigDirty || !effectiveServer)) {
           effectiveServer = parsed.apiServer;
           setApiServer(parsed.apiServer);
         }
@@ -423,6 +442,7 @@ export function ClusterConnectModal({
                     onChange={(e) => {
                       const val = e.target.value;
                       setKubeconfigText(val);
+                      setKubeconfigDirty(true);
                     }}
                     placeholder="粘贴 kubeconfig YAML/JSON 内容可自动提取 server、token 与证书..."
                     className="flex-1 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#0B0F17] p-2.5 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500"

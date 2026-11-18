@@ -1,4 +1,4 @@
-import { CheckSquare, ChevronDown, ChevronRight, Layers, RefreshCw, Search, Server, Square } from 'lucide-react';
+import { CheckSquare, ChevronDown, ChevronRight, Layers, RefreshCw, Search, Server, Square, X } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import type { ClusterConfig, PodInfo, SelectedTarget } from '../types/k8s';
 
@@ -8,6 +8,7 @@ interface SidebarProps {
   selectedNamespace: string;
   onSelectNamespace: (ns: string) => void;
   pods: PodInfo[];
+  totalPodCount?: number | null;
   isLoadingPods: boolean;
   onRefreshPods: () => void;
   selectedTarget: SelectedTarget | null;
@@ -39,6 +40,7 @@ export function Sidebar({
   selectedNamespace,
   onSelectNamespace,
   pods,
+  totalPodCount,
   isLoadingPods,
   onRefreshPods,
   selectedTarget,
@@ -133,7 +135,11 @@ export function Sidebar({
               onChange={(e) => onSelectNamespace(e.target.value)}
               className="w-full h-9 px-2.5 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131926] text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500"
             >
-              <option value="__all__">全部命名空间 ({pods.length})</option>
+              <option value="__all__">
+                {totalPodCount !== null && totalPodCount !== undefined
+                  ? `全部命名空间 (${totalPodCount})`
+                  : '全部命名空间'}
+              </option>
               {namespaces.map((ns) => (
                 <option key={ns} value={ns}>
                   {ns}
@@ -153,8 +159,18 @@ export function Sidebar({
             value={podSearch}
             onChange={(e) => setPodSearch(e.target.value)}
             placeholder="过滤 Pod 或容器名..."
-            className="w-full h-8 pl-8 pr-2.5 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131926] text-xs text-slate-800 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
+            className="w-full h-8 pl-8 pr-7 rounded-md border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#131926] text-xs text-slate-800 dark:text-slate-200 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
           />
+          {podSearch && (
+            <button
+              type="button"
+              onClick={() => setPodSearch('')}
+              aria-label="清除 Pod 搜索"
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
         </div>
 
         <div className="flex items-center justify-between gap-2">
@@ -199,7 +215,7 @@ export function Sidebar({
 
       {/* Pod & Container List */}
       <div className="flex-1 overflow-y-auto log-scrollbar p-2 space-y-1">
-        {isLoadingPods ? (
+        {isLoadingPods && pods.length === 0 ? (
           <div className="space-y-2 p-1">
             {[1, 2, 3, 4].map((idx) => (
               <div key={idx} className="h-14 rounded-md bg-slate-200/60 dark:bg-slate-800/40 animate-pulse" />

@@ -65,14 +65,24 @@ export function LogHistogram({
   }, [entries]);
 
   const activeBucket = useMemo(() => {
-    if (!activeRange) return null;
-    return (
-      buckets.find(
-        (b) =>
-          Math.abs(activeRange.startMs - b.startMs) < 1 &&
-          Math.abs(activeRange.endMs - b.endMs) < 1
-      ) || null
+    if (!activeRange || buckets.length === 0) return null;
+    const exact = buckets.find(
+      (b) =>
+        Math.abs(activeRange.startMs - b.startMs) < 1 &&
+        Math.abs(activeRange.endMs - b.endMs) < 1
     );
+    if (exact) return exact;
+
+    let best: HistogramBucket | null = null;
+    let bestOverlap = 0;
+    for (const b of buckets) {
+      const overlap = Math.min(activeRange.endMs, b.endMs) - Math.max(activeRange.startMs, b.startMs);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = b;
+      }
+    }
+    return best;
   }, [buckets, activeRange]);
 
   useEffect(() => {

@@ -64,29 +64,45 @@ function getRowSurfaceStyle(level: LogLevel, isSelected: boolean, isDimmedContex
 }
 
 function highlightText(text: string, search: string, isRegex: boolean, caseSensitive: boolean) {
-  if (!search.trim()) return text;
+  const query = search.trim();
+  if (!query) return text;
 
   try {
     const flags = caseSensitive ? 'g' : 'gi';
     const regex = isRegex
-      ? new RegExp(`(${search})`, flags)
-      : new RegExp(`(${search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, flags);
-    const parts = text.split(regex);
-    if (parts.length <= 1) return text;
+      ? new RegExp(query, flags)
+      : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
 
-    return parts.map((part, i) => {
-      if (i % 2 === 1) {
-        return (
-          <mark
-            key={i}
-            className="bg-amber-300/70 dark:bg-amber-500/40 text-slate-950 dark:text-amber-50 rounded-[2px] px-0.5"
-          >
-            {part}
-          </mark>
-        );
+    const nodes: Array<string | React.ReactNode> = [];
+    let lastIndex = 0;
+    let matchCount = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(text)) !== null && matchCount < 100) {
+      if (match[0].length === 0) {
+        regex.lastIndex += 1;
+        continue;
       }
-      return part;
-    });
+      if (match.index > lastIndex) {
+        nodes.push(text.slice(lastIndex, match.index));
+      }
+      nodes.push(
+        <mark
+          key={`${match.index}-${matchCount}`}
+          className="bg-amber-300/70 dark:bg-amber-500/40 text-slate-950 dark:text-amber-50 rounded-[2px] px-0.5"
+        >
+          {match[0]}
+        </mark>
+      );
+      lastIndex = match.index + match[0].length;
+      matchCount += 1;
+    }
+
+    if (nodes.length === 0) return text;
+    if (lastIndex < text.length) {
+      nodes.push(text.slice(lastIndex));
+    }
+    return nodes;
   } catch {
     return text;
   }
@@ -174,7 +190,9 @@ export function LogViewport({
     if (rowEl) {
       rowEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
     }
-    onSelectEntry(target);
+    if (selectedEntryId !== target.id) {
+      onSelectEntry(target);
+    }
     setMatchCursor((idx + 1) % alertDetection.matchedEntries.length);
   };
 

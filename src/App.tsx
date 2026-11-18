@@ -113,10 +113,16 @@ export default function App() {
   const [pods, setPods] = useState<PodInfo[]>(() =>
     initialCluster.mode === 'sandbox' ? SANDBOX_PODS : []
   );
-  const [isLoadingPods, setIsLoadingPods] = useState(false);
+  const [isLoadingPods, setIsLoadingPods] = useState(initialCluster.mode === 'k8s-api');
+  const [podsVerifiedClusterId, setPodsVerifiedClusterId] = useState<string | null>(
+    initialCluster.mode === 'k8s-api' ? null : initialCluster.id
+  );
+  const [hasAllPodsSnapshot, setHasAllPodsSnapshot] = useState<boolean>(
+    initialCluster.mode === 'sandbox'
+  );
 
   const [selectedTarget, setSelectedTarget] = useState<SelectedTarget | null>(() => {
-    const saved = loadSelectedTarget();
+    const saved = loadSelectedTarget(initialCluster.id);
     if (initialCluster.mode === 'k8s-api') {
       return saved;
     }
@@ -162,6 +168,10 @@ export default function App() {
 
   const importedEntriesRef = useRef<LogEntry[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const podsAbortRef = useRef<AbortController | null>(null);
+  const podsReqSeqRef = useRef(0);
+  const logsAbortRef = useRef<AbortController | null>(null);
+  const logsReqSeqRef = useRef(0);
 
   // Sync theme class on <html> and persist
   useEffect(() => {
@@ -188,9 +198,9 @@ export default function App() {
 
   useEffect(() => {
     if (cluster.mode !== 'imported-file') {
-      saveSelectedTarget(selectedTarget);
+      saveSelectedTarget(cluster.id, selectedTarget);
     }
-  }, [selectedTarget, cluster.mode]);
+  }, [selectedTarget, cluster.id, cluster.mode]);
 
   useEffect(() => {
     saveDisplayPrefs({
@@ -236,29 +246,83 @@ export default function App() {
   }, [connectModalOpen, selectedEntryId, patternPanelOpen]);
 
   const loadPodsForCluster = useCallback(
-    async (activeCluster: ClusterConfig, ns: string) => {
+    async (activeCluster: ClusterConfig, ns: string, fetchNsList = true) => {
       if (activeCluster.mode === 'sandbox') {
         setNamespaces(SANDBOX_NAMESPACES);
         setPods(SANDBOX_PODS);
+        setHasAllPodsSnapshot(true);
+        setPodsVerifiedClusterId(activeCluster.id);
         return;
       }
       if (activeCluster.mode === 'imported-file') {
         return;
       }
 
+      podsAbortRef.current?.abort();
+      const controller = new AbortController();
+      podsAbortRef.current = controller;
+      const seq = ++podsReqSeqRef.current;
+
       setIsLoadingPods(true);
       try {
-        const [nsList, podList] = await Promise.all([
-          fetchNamespaces(activeCluster),
-          fetchPods(activeCluster, ns),
+        const [nsSettled, podsSettled] = await Promise.allSettled([
+          fetchNsList ? fetchNamespaces(activeCluster, controller.signal) : Promise.resolve<string[] | null>(null),
+          fetchPods(activeCluster, ns, controller.signal),
         ]);
-        setNamespaces(nsList);
-        setPods(podList);
+
+        if (controller.signal.aborted || podsReqSeqRef.current !== seq) {
+          return;
+        }
+
+        if (podsSettled.status === 'rejected') {
+          const err = podsSettled.reason;
+          if (err instanceof DOMException && err.name === 'AbortError') return;
+          setLogError(err instanceof Error ? err.message : '无法获取集群 Pod 列表');
+          setPodsVerifiedClusterId(activeCluster.id);
+          return;
+        }
+
+        const podList = podsSettled.value;
+        setLogError(null);
+
+        if (!ns || ns === '__all__') {
+          setPods(podList);
+          setHasAllPodsSnapshot(true);
+        } else {
+          setPods((prev) =>
+            [...prev.filter((p) => p.namespace !== ns), ...podList].sort(
+              (a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name)
+            )
+          );
+        }
+
+        const fetchedNs =
+          nsSettled.status === 'fulfilled' && Array.isArray(nsSettled.value)
+            ? nsSettled.value
+            : [];
+        const derivedNs = podList.map((p) => p.namespace).filter(Boolean);
+        setNamespaces((prev) => {
+          const merged = new Set<string>([
+            ...(!ns || ns === '__all__' ? [] : prev),
+            ...fetchedNs,
+            ...derivedNs,
+          ]);
+          return Array.from(merged).sort((a, b) => a.localeCompare(b));
+        });
+
         if (podList.length > 0) {
           const first = podList[0];
           const firstContainer = first.containers[0]?.name || '';
           setSelectedTarget((prev) => {
-            if (prev && podList.some((p) => p.name === prev.pod && p.namespace === prev.namespace)) {
+            if (
+              prev &&
+              podList.some(
+                (p) =>
+                  p.name === prev.pod &&
+                  p.namespace === prev.namespace &&
+                  (!prev.container || p.containers.some((c) => c.name === prev.container))
+              )
+            ) {
               return prev;
             }
             return {
@@ -268,11 +332,23 @@ export default function App() {
               previous: false,
             };
           });
+        } else if (!ns || ns === '__all__') {
+          setSelectedTarget(null);
+        } else {
+          setSelectedTarget((prev) => (prev && prev.namespace === ns ? null : prev));
         }
+
+        setPodsVerifiedClusterId(activeCluster.id);
       } catch (err) {
-        setLogError(err instanceof Error ? err.message : '无法获取集群 Pod 列表');
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        if (podsReqSeqRef.current === seq) {
+          setLogError(err instanceof Error ? err.message : '无法获取集群 Pod 列表');
+          setPodsVerifiedClusterId(activeCluster.id);
+        }
       } finally {
-        setIsLoadingPods(false);
+        if (podsReqSeqRef.current === seq) {
+          setIsLoadingPods(false);
+        }
       }
     },
     []
@@ -281,12 +357,20 @@ export default function App() {
   // Automatically restore pods when reloading a persisted K8s API cluster
   useEffect(() => {
     if (initialCluster.mode === 'k8s-api') {
-      loadPodsForCluster(initialCluster, initialNamespaceRef.current || '__all__');
+      loadPodsForCluster(initialCluster, initialNamespaceRef.current || '__all__', true);
     }
+    return () => {
+      podsAbortRef.current?.abort();
+      logsAbortRef.current?.abort();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadLogs = useCallback(async () => {
+    if (cluster.mode === 'k8s-api' && podsVerifiedClusterId !== cluster.id) {
+      return;
+    }
+
     setLogError(null);
 
     if (cluster.mode === 'imported-file') {
@@ -324,19 +408,28 @@ export default function App() {
     }
 
     // Real Kubernetes API mode
+    logsAbortRef.current?.abort();
+    const controller = new AbortController();
+    logsAbortRef.current = controller;
+    const seq = ++logsReqSeqRef.current;
+
     setIsLoadingLogs(true);
     try {
       const tail = filters.tailLines > 0 ? filters.tailLines : 5000;
       if (isMultiPodMode) {
         const allResults = await Promise.all(
           multiPodSelection.map(async (item) => {
-            const raw = await fetchPodLogs(cluster, {
-              namespace: item.namespace,
-              pod: item.pod,
-              container: item.container,
-              tailLines: tail,
-              previous: false,
-            });
+            const raw = await fetchPodLogs(
+              cluster,
+              {
+                namespace: item.namespace,
+                pod: item.pod,
+                container: item.container,
+                tailLines: tail,
+                previous: false,
+              },
+              controller.signal
+            );
             return parseRawLogs(
               raw,
               { namespace: item.namespace, pod: item.pod, container: item.container },
@@ -344,16 +437,22 @@ export default function App() {
             );
           })
         );
+        if (controller.signal.aborted || logsReqSeqRef.current !== seq) return;
         const merged = allResults.flat().sort((a, b) => a.timestampMs - b.timestampMs);
         setRawEntries(merged.map((e, i) => ({ ...e, lineNumber: i + 1 })));
       } else if (selectedTarget) {
-        const raw = await fetchPodLogs(cluster, {
-          namespace: selectedTarget.namespace,
-          pod: selectedTarget.pod,
-          container: selectedTarget.container,
-          tailLines: tail,
-          previous: selectedTarget.previous,
-        });
+        const raw = await fetchPodLogs(
+          cluster,
+          {
+            namespace: selectedTarget.namespace,
+            pod: selectedTarget.pod,
+            container: selectedTarget.container,
+            tailLines: tail,
+            previous: selectedTarget.previous,
+          },
+          controller.signal
+        );
+        if (controller.signal.aborted || logsReqSeqRef.current !== seq) return;
         const parsed = parseRawLogs(
           raw,
           {
@@ -368,12 +467,17 @@ export default function App() {
         setRawEntries([]);
       }
     } catch (err) {
-      setLogError(err instanceof Error ? err.message : '拉取 Pod 日志失败');
-      setRawEntries([]);
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      if (logsReqSeqRef.current === seq) {
+        setLogError(err instanceof Error ? err.message : '拉取 Pod 日志失败');
+        setRawEntries([]);
+      }
     } finally {
-      setIsLoadingLogs(false);
+      if (logsReqSeqRef.current === seq) {
+        setIsLoadingLogs(false);
+      }
     }
-  }, [cluster, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines]);
+  }, [cluster, podsVerifiedClusterId, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines]);
 
   useEffect(() => {
     loadLogs();
@@ -410,31 +514,81 @@ export default function App() {
       return () => clearInterval(timer);
     }
 
-    if (cluster.mode === 'k8s-api' && selectedTarget && !selectedTarget.previous) {
-      const timer = setInterval(async () => {
+    if (cluster.mode === 'k8s-api' && (isMultiPodMode ? multiPodSelection.length > 0 : Boolean(selectedTarget && !selectedTarget.previous))) {
+      let cancelled = false;
+      let timerId: number | null = null;
+      let controller: AbortController | null = null;
+
+      const pollOnce = async () => {
+        if (cancelled) return;
+        controller = new AbortController();
+        const tail = filters.tailLines > 0 ? filters.tailLines : 500;
         try {
-          const raw = await fetchPodLogs(cluster, {
-            namespace: selectedTarget.namespace,
-            pod: selectedTarget.pod,
-            container: selectedTarget.container,
-            tailLines: filters.tailLines > 0 ? filters.tailLines : 500,
-            previous: false,
-          });
-          const parsed = parseRawLogs(
-            raw,
-            {
-              namespace: selectedTarget.namespace,
-              pod: selectedTarget.pod,
-              container: selectedTarget.container,
-            },
-            `${selectedTarget.pod}-${selectedTarget.container}`
-          );
-          setRawEntries(parsed);
+          if (isMultiPodMode) {
+            const allResults = await Promise.all(
+              multiPodSelection.map(async (item) => {
+                const raw = await fetchPodLogs(
+                  cluster,
+                  {
+                    namespace: item.namespace,
+                    pod: item.pod,
+                    container: item.container,
+                    tailLines: tail,
+                    previous: false,
+                  },
+                  controller!.signal
+                );
+                return parseRawLogs(
+                  raw,
+                  { namespace: item.namespace, pod: item.pod, container: item.container },
+                  `${item.pod}-${item.container}`
+                );
+              })
+            );
+            if (!cancelled) {
+              const merged = allResults.flat().sort((a, b) => a.timestampMs - b.timestampMs);
+              setRawEntries(merged.map((e, i) => ({ ...e, lineNumber: i + 1 })));
+            }
+          } else if (selectedTarget) {
+            const raw = await fetchPodLogs(
+              cluster,
+              {
+                namespace: selectedTarget.namespace,
+                pod: selectedTarget.pod,
+                container: selectedTarget.container,
+                tailLines: tail,
+                previous: false,
+              },
+              controller.signal
+            );
+            if (!cancelled) {
+              const parsed = parseRawLogs(
+                raw,
+                {
+                  namespace: selectedTarget.namespace,
+                  pod: selectedTarget.pod,
+                  container: selectedTarget.container,
+                },
+                `${selectedTarget.pod}-${selectedTarget.container}`
+              );
+              setRawEntries(parsed);
+            }
+          }
         } catch {
           // Keep current view during transient live poll hiccups
+        } finally {
+          if (!cancelled) {
+            timerId = window.setTimeout(pollOnce, 2500);
+          }
         }
-      }, 2500);
-      return () => clearInterval(timer);
+      };
+
+      timerId = window.setTimeout(pollOnce, 2500);
+      return () => {
+        cancelled = true;
+        if (timerId !== null) window.clearTimeout(timerId);
+        controller?.abort();
+      };
     }
   }, [isLiveTail, cluster, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines]);
 
@@ -587,15 +741,20 @@ export default function App() {
   const handleSelectNamespace = (ns: string) => {
     setSelectedNamespace(ns);
     if (cluster.mode === 'k8s-api') {
-      loadPodsForCluster(cluster, ns);
+      loadPodsForCluster(cluster, ns, namespaces.length === 0 || ns === '__all__');
     }
   };
 
   const handleConnectK8sCluster = (nextCluster: ClusterConfig, remember = true) => {
+    podsAbortRef.current?.abort();
+    logsAbortRef.current?.abort();
     setIsLiveTail(false);
     setIsMultiPodMode(false);
     setMultiPodSelection([]);
     setSelectedTarget(null);
+    saveSelectedTarget(nextCluster.id, null);
+    setPodsVerifiedClusterId(null);
+    setHasAllPodsSnapshot(false);
     setSelectedEntryId(null);
     setNamespaces([]);
     setPods([]);
@@ -614,7 +773,7 @@ export default function App() {
       saveActiveCluster(null);
     }
 
-    loadPodsForCluster(nextCluster, '__all__');
+    loadPodsForCluster(nextCluster, '__all__', true);
   };
 
   const handleDeleteSavedCluster = (clusterId: string) => {
@@ -631,8 +790,13 @@ export default function App() {
     namespace: string;
     container: string;
   }) => {
+    podsAbortRef.current?.abort();
+    logsAbortRef.current?.abort();
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setIsLoadingPods(false);
+    setIsLoadingLogs(false);
+    setLogError(null);
     const parsed = parseRawLogs(
       payload.rawText,
       {
@@ -643,11 +807,14 @@ export default function App() {
       'imported'
     );
     importedEntriesRef.current = parsed;
-    setCluster({
+    const fileCluster: ClusterConfig = {
       id: `file-${Date.now()}`,
       name: payload.name,
       mode: 'imported-file',
-    });
+    };
+    setCluster(fileCluster);
+    setPodsVerifiedClusterId(fileCluster.id);
+    setHasAllPodsSnapshot(true);
     setNamespaces([payload.namespace]);
     setSelectedNamespace(payload.namespace);
     setPods([
@@ -681,10 +848,17 @@ export default function App() {
   };
 
   const handleSwitchToSandbox = () => {
+    podsAbortRef.current?.abort();
+    logsAbortRef.current?.abort();
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setIsLoadingPods(false);
+    setIsLoadingLogs(false);
+    setLogError(null);
     saveActiveCluster(DEFAULT_SANDBOX_CLUSTER);
     setCluster(DEFAULT_SANDBOX_CLUSTER);
+    setPodsVerifiedClusterId(DEFAULT_SANDBOX_CLUSTER.id);
+    setHasAllPodsSnapshot(true);
     setNamespaces(SANDBOX_NAMESPACES);
     setSelectedNamespace('prod-ecommerce');
     setPods(SANDBOX_PODS);
@@ -748,8 +922,9 @@ export default function App() {
             selectedNamespace={selectedNamespace}
             onSelectNamespace={handleSelectNamespace}
             pods={pods}
+            totalPodCount={cluster.mode === 'sandbox' || hasAllPodsSnapshot ? pods.length : null}
             isLoadingPods={isLoadingPods}
-            onRefreshPods={() => loadPodsForCluster(cluster, selectedNamespace)}
+            onRefreshPods={() => loadPodsForCluster(cluster, selectedNamespace, true)}
             selectedTarget={selectedTarget}
             onSelectContainer={(target) => {
               setIsLiveTail(false);
@@ -758,7 +933,17 @@ export default function App() {
             isMultiPodMode={isMultiPodMode}
             onToggleMultiPodMode={() => {
               setIsLiveTail(false);
-              setIsMultiPodMode((m) => !m);
+              const next = !isMultiPodMode;
+              setIsMultiPodMode(next);
+              if (next && multiPodSelection.length === 0 && selectedTarget) {
+                setMultiPodSelection([
+                  {
+                    namespace: selectedTarget.namespace,
+                    pod: selectedTarget.pod,
+                    container: selectedTarget.container,
+                  },
+                ]);
+              }
             }}
             multiPodSelection={multiPodSelection}
             onToggleMultiPodItem={handleToggleMultiPodItem}

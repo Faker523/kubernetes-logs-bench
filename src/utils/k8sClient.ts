@@ -11,8 +11,8 @@ function toBase64(val?: string): string | undefined {
 
 function buildClusterHeaders(cluster: ClusterConfig): Record<string, string> {
   const headers: Record<string, string> = {};
-  if (cluster.apiServer) headers['x-k8s-server'] = cluster.apiServer;
-  if (cluster.token) headers['x-k8s-token'] = cluster.token;
+  if (cluster.apiServer?.trim()) headers['x-k8s-server'] = cluster.apiServer.trim();
+  if (cluster.token?.trim()) headers['x-k8s-token'] = cluster.token.trim();
   if (cluster.insecureTls) headers['x-k8s-insecure'] = 'true';
   const caB64 = toBase64(cluster.caCert);
   if (caB64) headers['x-k8s-ca-b64'] = caB64;
@@ -100,9 +100,13 @@ export async function loadLocalKubeconfig(): Promise<{
   return data;
 }
 
-export async function fetchNamespaces(cluster: ClusterConfig): Promise<string[]> {
+export async function fetchNamespaces(
+  cluster: ClusterConfig,
+  signal?: AbortSignal
+): Promise<string[]> {
   const res = await fetch('/api/k8s/namespaces', {
     headers: buildClusterHeaders(cluster),
+    signal,
   });
   const data = await res.json();
   if (!res.ok) {
@@ -111,11 +115,16 @@ export async function fetchNamespaces(cluster: ClusterConfig): Promise<string[]>
   return data.namespaces || [];
 }
 
-export async function fetchPods(cluster: ClusterConfig, namespace: string): Promise<PodInfo[]> {
+export async function fetchPods(
+  cluster: ClusterConfig,
+  namespace: string,
+  signal?: AbortSignal
+): Promise<PodInfo[]> {
   const params = new URLSearchParams();
   if (namespace) params.set('namespace', namespace);
   const res = await fetch(`/api/k8s/pods?${params.toString()}`, {
     headers: buildClusterHeaders(cluster),
+    signal,
   });
   const data = await res.json();
   if (!res.ok) {
@@ -133,7 +142,8 @@ export async function fetchPodLogs(
     tailLines: number;
     previous: boolean;
     sinceSeconds?: number;
-  }
+  },
+  signal?: AbortSignal
 ): Promise<string> {
   const qs = new URLSearchParams({
     namespace: params.namespace,
@@ -147,6 +157,7 @@ export async function fetchPodLogs(
   }
   const res = await fetch(`/api/k8s/logs?${qs.toString()}`, {
     headers: buildClusterHeaders(cluster),
+    signal,
   });
   const data = await res.json();
   if (!res.ok) {

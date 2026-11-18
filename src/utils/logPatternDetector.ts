@@ -104,7 +104,7 @@ export function buildEquivalentRegex(template: string): string {
     .map((t) =>
       t.isPlaceholder
         ? TOKEN_EQUIVALENT_MAP.get(t.text) ?? '.*?'
-        : escapeRegexLiteral(t.text).replace(/\\ /g, '\\s+')
+        : escapeRegexLiteral(t.text).replace(/ /g, '\\s+')
     )
     .join('');
 }
