@@ -49,8 +49,9 @@ RUN if [ -f package-lock.json ]; then npm ci --omit=dev --ignore-scripts; else n
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.mjs ./server.mjs
 
-# Ensure non-root execution (note: if mounting host kubeconfig, ensure file is readable by uid 1000)
-RUN chown -R node:node /app
+# Run as non-root. No recursive chown: node_modules stays root-owned and read-only at
+# runtime, which is fine for this server (it only reads /app and serves dist/).
+# If mounting a host kubeconfig, ensure the file is readable by uid 1000.
 USER node
 
 EXPOSE 3000
