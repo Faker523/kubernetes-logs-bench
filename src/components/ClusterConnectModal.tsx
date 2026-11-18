@@ -1,4 +1,4 @@
-import { CheckCircle2, FileUp, HardDrive, Server, Upload, X } from 'lucide-react';
+import { CheckCircle2, FileUp, HardDrive, Server, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { ClusterConfig } from '../types/k8s';
 import {
@@ -12,7 +12,9 @@ interface ClusterConnectModalProps {
   isOpen: boolean;
   onClose: () => void;
   activeCluster: ClusterConfig;
-  onConnectK8sCluster: (config: ClusterConfig) => void;
+  savedClusters: ClusterConfig[];
+  onConnectK8sCluster: (config: ClusterConfig, remember?: boolean) => void;
+  onDeleteSavedCluster: (clusterId: string) => void;
   onImportLogs: (payload: { name: string; rawText: string; podName: string; namespace: string; container: string }) => void;
   onSwitchToSandbox: () => void;
 }
@@ -21,7 +23,9 @@ export function ClusterConnectModal({
   isOpen,
   onClose,
   activeCluster,
+  savedClusters,
   onConnectK8sCluster,
+  onDeleteSavedCluster,
   onImportLogs,
   onSwitchToSandbox,
 }: ClusterConnectModalProps) {
@@ -35,6 +39,7 @@ export function ClusterConnectModal({
   const [clientCert, setClientCert] = useState(activeCluster.clientCert || '');
   const [clientKey, setClientKey] = useState(activeCluster.clientKey || '');
   const [insecureTls, setInsecureTls] = useState(activeCluster.insecureTls ?? true);
+  const [rememberConnection, setRememberConnection] = useState(true);
   const [kubeconfigText, setKubeconfigText] = useState('');
   const [showAdvancedTls, setShowAdvancedTls] = useState(false);
 
@@ -194,18 +199,21 @@ export function ClusterConnectModal({
         return;
       }
 
-      onConnectK8sCluster({
-        id: `k8s-${Date.now()}`,
-        name: effectiveName || 'k8s-cluster',
-        mode: 'k8s-api',
-        apiServer: effectiveServer,
-        token: effectiveToken || undefined,
-        caCert: effectiveCa || undefined,
-        clientCert: effectiveCert || undefined,
-        clientKey: effectiveKey || undefined,
-        insecureTls: effectiveInsecure,
-        gitVersion: result.gitVersion,
-      });
+      onConnectK8sCluster(
+        {
+          id: `k8s-${Date.now()}`,
+          name: effectiveName || 'k8s-cluster',
+          mode: 'k8s-api',
+          apiServer: effectiveServer,
+          token: effectiveToken || undefined,
+          caCert: effectiveCa || undefined,
+          clientCert: effectiveCert || undefined,
+          clientKey: effectiveKey || undefined,
+          insecureTls: effectiveInsecure,
+          gitVersion: result.gitVersion,
+        },
+        rememberConnection
+      );
       onClose();
     } catch (err) {
       setTestError(err instanceof Error ? err.message : '请求测试失败');
@@ -304,6 +312,59 @@ export function ClusterConnectModal({
         <div className="p-5 overflow-y-auto log-scrollbar">
           {tab === 'k8s' && (
             <form onSubmit={handleConnectK8s} className="space-y-4">
+              {savedClusters.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                    已保存的集群（刷新后自动保持）
+                  </div>
+                  <div className="divide-y divide-slate-200 dark:divide-slate-800 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-[#0B0F17]">
+                    {savedClusters.map((item) => {
+                      const isCurrent =
+                        activeCluster.mode === 'k8s-api' && activeCluster.apiServer === item.apiServer;
+                      return (
+                        <div
+                          key={item.id}
+                          className="px-3 py-2 flex items-center justify-between gap-2 text-xs"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onConnectK8sCluster(item, true);
+                              onClose();
+                            }}
+                            className="flex-1 min-w-0 text-left group"
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-slate-900 dark:text-slate-100 group-hover:text-sky-600 dark:group-hover:text-sky-400 truncate">
+                                {item.name}
+                              </span>
+                              {isCurrent && (
+                                <span className="font-mono text-[10px] text-emerald-600 dark:text-emerald-400">
+                                  当前已连接
+                                </span>
+                              )}
+                            </div>
+                            <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                              {item.apiServer}
+                              {item.gitVersion ? ` · ${item.gitVersion}` : ''}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => onDeleteSavedCluster(item.id)}
+                            aria-label={`删除已保存集群 ${item.name}`}
+                            title="删除记录"
+                            className="p-1.5 rounded text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-500/10 shrink-0"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               {(localStatus?.hasLocalKubeconfig || localStatus?.hasInCluster) && (
                 localStatus.hasLocalKubeconfig && !localStatus.kubeconfigReadable ? (
                   <div className="p-3 rounded-md border border-amber-200 dark:border-amber-900/60 bg-amber-50 dark:bg-amber-950/25 text-xs text-amber-800 dark:text-amber-200 space-y-1">
@@ -488,21 +549,33 @@ export function ClusterConnectModal({
                 </div>
               )}
 
-              <div className="pt-2 flex items-center justify-end gap-2.5">
-                <button
-                  type="button"
-                  onClick={onClose}
-                  className="h-9 px-4 rounded-md border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  disabled={testing}
-                  className="h-9 px-4 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white disabled:opacity-50"
-                >
-                  {testing ? '正在验证连接...' : '测试并连接'}
-                </button>
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={rememberConnection}
+                    onChange={(e) => setRememberConnection(e.target.checked)}
+                    className="rounded border-slate-300 dark:border-slate-700 text-sky-600 focus:ring-sky-500"
+                  />
+                  <span>记住连接配置（保存在本地浏览器，刷新不丢失）</span>
+                </label>
+
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={onClose}
+                    className="h-9 px-4 rounded-md border border-slate-200 dark:border-slate-800 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={testing}
+                    className="h-9 px-4 rounded-md bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white disabled:opacity-50"
+                  >
+                    {testing ? '正在验证连接...' : '测试并连接'}
+                  </button>
+                </div>
               </div>
             </form>
           )}

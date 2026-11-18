@@ -24,6 +24,22 @@ import type {
 import { fetchNamespaces, fetchPodLogs, fetchPods } from './utils/k8sClient';
 import { exportLogsToFile, parseRawLogs } from './utils/logParser';
 import { aggregateLogPatterns } from './utils/logPatternDetector';
+import {
+  loadActiveCluster,
+  loadDisplayPrefs,
+  loadPersistedSidebarOpen,
+  loadPersistedTheme,
+  loadSavedClusters,
+  loadSelectedNamespace,
+  loadSelectedTarget,
+  saveActiveCluster,
+  saveDisplayPrefs,
+  savePersistedSidebarOpen,
+  savePersistedTheme,
+  saveSavedClusters,
+  saveSelectedNamespace,
+  saveSelectedTarget,
+} from './utils/storage';
 
 const DEFAULT_SANDBOX_CLUSTER: ClusterConfig = {
   id: 'sandbox-prod',
@@ -67,37 +83,78 @@ function matchesTextQuery(
 }
 
 export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const initialClusterRef = useRef<ClusterConfig | null>(null);
+  if (initialClusterRef.current === null) {
+    initialClusterRef.current = loadActiveCluster() || DEFAULT_SANDBOX_CLUSTER;
+  }
+  const initialCluster = initialClusterRef.current;
+
+  const initialNamespaceRef = useRef<string | null>(null);
+  if (initialNamespaceRef.current === null) {
+    const savedNs = loadSelectedNamespace();
+    initialNamespaceRef.current =
+      initialCluster.mode === 'k8s-api'
+        ? savedNs || '__all__'
+        : savedNs && SANDBOX_NAMESPACES.includes(savedNs)
+          ? savedNs
+          : 'prod-ecommerce';
+  }
+
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => loadPersistedTheme());
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => loadPersistedSidebarOpen());
   const [connectModalOpen, setConnectModalOpen] = useState(false);
 
-  const [cluster, setCluster] = useState<ClusterConfig>(DEFAULT_SANDBOX_CLUSTER);
-  const [namespaces, setNamespaces] = useState<string[]>(SANDBOX_NAMESPACES);
-  const [selectedNamespace, setSelectedNamespace] = useState<string>('prod-ecommerce');
-  const [pods, setPods] = useState<PodInfo[]>(SANDBOX_PODS);
+  const [savedClusters, setSavedClusters] = useState<ClusterConfig[]>(() => loadSavedClusters());
+  const [cluster, setCluster] = useState<ClusterConfig>(initialCluster);
+  const [namespaces, setNamespaces] = useState<string[]>(() =>
+    initialCluster.mode === 'sandbox' ? SANDBOX_NAMESPACES : []
+  );
+  const [selectedNamespace, setSelectedNamespace] = useState<string>(initialNamespaceRef.current);
+  const [pods, setPods] = useState<PodInfo[]>(() =>
+    initialCluster.mode === 'sandbox' ? SANDBOX_PODS : []
+  );
   const [isLoadingPods, setIsLoadingPods] = useState(false);
 
-  const [selectedTarget, setSelectedTarget] = useState<SelectedTarget | null>({
-    namespace: 'prod-ecommerce',
-    pod: 'order-api-7f9d8c4b2-x9k2p',
-    container: 'app',
-    previous: false,
+  const [selectedTarget, setSelectedTarget] = useState<SelectedTarget | null>(() => {
+    const saved = loadSelectedTarget();
+    if (initialCluster.mode === 'k8s-api') {
+      return saved;
+    }
+    if (
+      saved &&
+      SANDBOX_PODS.some((p) => p.namespace === saved.namespace && p.name === saved.pod)
+    ) {
+      return saved;
+    }
+    return {
+      namespace: 'prod-ecommerce',
+      pod: 'order-api-7f9d8c4b2-x9k2p',
+      container: 'app',
+      previous: false,
+    };
   });
 
   const [isMultiPodMode, setIsMultiPodMode] = useState(false);
   const [multiPodSelection, setMultiPodSelection] = useState<
     Array<{ namespace: string; pod: string; container: string }>
-  >([
-    { namespace: 'prod-ecommerce', pod: 'order-api-7f9d8c4b2-x9k2p', container: 'app' },
-    { namespace: 'prod-ecommerce', pod: 'payment-worker-5c6b89d74-m4n1q', container: 'worker' },
-  ]);
+  >(() =>
+    initialCluster.mode === 'sandbox'
+      ? [
+          { namespace: 'prod-ecommerce', pod: 'order-api-7f9d8c4b2-x9k2p', container: 'app' },
+          { namespace: 'prod-ecommerce', pod: 'payment-worker-5c6b89d74-m4n1q', container: 'worker' },
+        ]
+      : []
+  );
 
   const [rawEntries, setRawEntries] = useState<LogEntry[]>([]);
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
   const [logError, setLogError] = useState<string | null>(null);
   const [isLiveTail, setIsLiveTail] = useState(false);
 
-  const [filters, setFilters] = useState<FilterState>(INITIAL_FILTERS);
+  const [filters, setFilters] = useState<FilterState>(() => ({
+    ...INITIAL_FILTERS,
+    ...loadDisplayPrefs(),
+  }));
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [patternPanelOpen, setPatternPanelOpen] = useState(false);
   const [excludedPatternIds, setExcludedPatternIds] = useState<string[]>([]);
@@ -106,7 +163,7 @@ export default function App() {
   const importedEntriesRef = useRef<LogEntry[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Sync theme class on <html>
+  // Sync theme class on <html> and persist
   useEffect(() => {
     const root = document.documentElement;
     if (theme === 'dark') {
@@ -114,7 +171,44 @@ export default function App() {
     } else {
       root.classList.remove('dark');
     }
+    savePersistedTheme(theme);
   }, [theme]);
+
+  useEffect(() => {
+    savePersistedSidebarOpen(sidebarOpen);
+  }, [sidebarOpen]);
+
+  useEffect(() => {
+    saveSavedClusters(savedClusters);
+  }, [savedClusters]);
+
+  useEffect(() => {
+    saveSelectedNamespace(selectedNamespace);
+  }, [selectedNamespace]);
+
+  useEffect(() => {
+    if (cluster.mode !== 'imported-file') {
+      saveSelectedTarget(selectedTarget);
+    }
+  }, [selectedTarget, cluster.mode]);
+
+  useEffect(() => {
+    saveDisplayPrefs({
+      tailLines: filters.tailLines,
+      showTimestamp: filters.showTimestamp,
+      showLineNumbers: filters.showLineNumbers,
+      wrapLines: filters.wrapLines,
+      contextLines: filters.contextLines,
+      jsonPreview: filters.jsonPreview,
+    });
+  }, [
+    filters.tailLines,
+    filters.showTimestamp,
+    filters.showLineNumbers,
+    filters.wrapLines,
+    filters.contextLines,
+    filters.jsonPreview,
+  ]);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -183,6 +277,14 @@ export default function App() {
     },
     []
   );
+
+  // Automatically restore pods when reloading a persisted K8s API cluster
+  useEffect(() => {
+    if (initialCluster.mode === 'k8s-api') {
+      loadPodsForCluster(initialCluster, initialNamespaceRef.current || '__all__');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const loadLogs = useCallback(async () => {
     setLogError(null);
@@ -489,7 +591,7 @@ export default function App() {
     }
   };
 
-  const handleConnectK8sCluster = (nextCluster: ClusterConfig) => {
+  const handleConnectK8sCluster = (nextCluster: ClusterConfig, remember = true) => {
     setIsLiveTail(false);
     setIsMultiPodMode(false);
     setMultiPodSelection([]);
@@ -501,7 +603,25 @@ export default function App() {
     setLogError(null);
     setCluster(nextCluster);
     setSelectedNamespace('__all__');
+
+    if (remember) {
+      saveActiveCluster(nextCluster);
+      setSavedClusters((prev) => {
+        const filtered = prev.filter((c) => c.apiServer !== nextCluster.apiServer);
+        return [nextCluster, ...filtered].slice(0, 10);
+      });
+    } else {
+      saveActiveCluster(null);
+    }
+
     loadPodsForCluster(nextCluster, '__all__');
+  };
+
+  const handleDeleteSavedCluster = (clusterId: string) => {
+    setSavedClusters((prev) => prev.filter((c) => c.id !== clusterId));
+    if (cluster.id === clusterId) {
+      saveActiveCluster(null);
+    }
   };
 
   const handleImportLogs = (payload: {
@@ -563,6 +683,7 @@ export default function App() {
   const handleSwitchToSandbox = () => {
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    saveActiveCluster(DEFAULT_SANDBOX_CLUSTER);
     setCluster(DEFAULT_SANDBOX_CLUSTER);
     setNamespaces(SANDBOX_NAMESPACES);
     setSelectedNamespace('prod-ecommerce');
@@ -777,7 +898,9 @@ export default function App() {
         isOpen={connectModalOpen}
         onClose={() => setConnectModalOpen(false)}
         activeCluster={cluster}
+        savedClusters={savedClusters}
         onConnectK8sCluster={handleConnectK8sCluster}
+        onDeleteSavedCluster={handleDeleteSavedCluster}
         onImportLogs={handleImportLogs}
         onSwitchToSandbox={handleSwitchToSandbox}
       />
