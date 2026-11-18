@@ -1,0 +1,6 @@
+{
+  "name": "KubeLog Workbench",
+  "description": "Kubernetes Pod 日志查看、多容器聚合追踪与结构化日志分析工作台",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
