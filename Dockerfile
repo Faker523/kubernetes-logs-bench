@@ -45,9 +45,9 @@ COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev --ignore-scripts; else npm install --omit=dev --ignore-scripts; fi \
   && npm cache clean --force
 
-# Copy compiled frontend & server artifacts
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/server.mjs ./server.mjs
+# Copy compiled frontend & server artifacts owned by node
+COPY --from=builder --chown=node:node /app/dist ./dist
+COPY --from=builder --chown=node:node /app/server.mjs ./server.mjs
 
 # Run as non-root. No recursive chown: node_modules stays root-owned and read-only at
 # runtime, which is fine for this server (it only reads /app and serves dist/).
