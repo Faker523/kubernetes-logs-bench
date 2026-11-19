@@ -1,3 +1,5 @@
+import 'dotenv/config';
+import { GoogleGenAI, Type } from '@google/genai';
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
@@ -5,9 +7,99 @@ import https from 'https';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import type { AiDiagnosisReport, AiEntryExplainPayload, SanitizedLogContext } from './src/types/ai';
+import { redactSensitiveText } from './src/utils/logRedactor';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+const AI_MODEL = 'gemini-4-hydrogen';
+
+function getGeminiClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) {
+    throw new Error(
+      '服务端未配置 GEMINI_API_KEY 环境变量。请在运行环境（AI Studio Secrets 面板或 Docker -e GEMINI_API_KEY=...）中配置后再使用 AI 诊断功能。'
+    );
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function formatGeminiError(err: unknown): { status: number; message: string } {
+  const raw = err instanceof Error ? err.message : String(err || 'AI 服务调用失败');
+  if (raw.includes('GEMINI_API_KEY') && raw.includes('未配置')) {
+    return { status: 503, message: raw };
+  }
+  if (/API_KEY_INVALID|PERMISSION_DENIED|401|403/i.test(raw)) {
+    return {
+      status: 403,
+      message: 'AI 鉴权失败：请检查服务端 GEMINI_API_KEY 是否有效（在 Settings > Secrets 或容器环境变量中确认）。',
+    };
+  }
+  if (/RESOURCE_EXHAUSTED|429|quota/i.test(raw)) {
+    return {
+      status: 429,
+      message: 'AI 请求触发频率或配额限制 (429)，请稍后重试或检查 API 配额。',
+    };
+  }
+  if (/NOT_FOUND|404/i.test(raw)) {
+    return {
+      status: 502,
+      message: `请求的 AI 模型 (${AI_MODEL}) 不可用，请检查服务端配置。`,
+    };
+  }
+  return { status: 502, message: `AI 分析请求失败: ${raw.slice(0, 300)}` };
+}
+
+function sanitizeStringServerSide(val: unknown, maxLen: number): string {
+  if (typeof val !== 'string') return '';
+  return redactSensitiveText(val.slice(0, maxLen)).text;
+}
+
+function buildServerLogContextText(context: SanitizedLogContext): string {
+  const t = context?.target;
+  const s = context?.stats;
+  const targetLine = `集群: ${sanitizeStringServerSide(t?.clusterName, 120)} | 命名空间: ${sanitizeStringServerSide(t?.namespace, 120)} | Pod: ${sanitizeStringServerSide(t?.pod, 180)} | 容器: ${sanitizeStringServerSide(t?.container, 120)}${t?.previous ? ' (--previous 上次崩溃实例)' : ''}`;
+  const statsLine = `日志统计: 总计 ${Number(s?.totalLines) || 0} 行 (ERROR=${Number(s?.errorCount) || 0}, WARN=${Number(s?.warnCount) || 0}, INFO=${Number(s?.infoCount) || 0}, 高危关键词命中=${Number(s?.alertHitCount) || 0})`;
+
+  const patternsText = Array.isArray(context?.topPatterns)
+    ? context.topPatterns
+        .slice(0, 12)
+        .map(
+          (p) =>
+            `- [${p.level}] 出现 ${Number(p.count) || 0} 次 (${Number(p.sharePct) || 0}%): ${sanitizeStringServerSide(p.template, 260)}`
+        )
+        .join('\n')
+    : '';
+
+  const excerptsText = Array.isArray(context?.excerpts)
+    ? context.excerpts
+        .slice(0, 75)
+        .map((e) => {
+          const lineNo = Number(e.lineNumber) || 0;
+          const msg = sanitizeStringServerSide(e.message, 500);
+          const stack = e.stackPreview ? `\n  堆栈:\n  ${sanitizeStringServerSide(e.stackPreview, 900).replace(/\n/g, '\n  ')}` : '';
+          return `#${lineNo} [${sanitizeStringServerSide(e.timeDisplay, 32)}] [${e.level}] (${sanitizeStringServerSide(e.pod, 100)}/${sanitizeStringServerSide(e.container, 60)}) ${msg}${stack}`;
+        })
+        .join('\n')
+    : '';
+
+  return [
+    targetLine,
+    statsLine,
+    patternsText ? `\n### 高频日志模式摘要\n${patternsText}` : '',
+    excerptsText ? `\n### 关键脱敏日志片段（含原始行号 #N）\n${excerptsText}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
 
 interface K8sRequestConfig {
   apiServer: string;
@@ -989,6 +1081,296 @@ async function startServer() {
   };
   app.get('/api/k8s/logs', handleFetchLogs);
   app.post('/api/k8s/logs', handleFetchLogs);
+
+  // AI Route 1: Structured Root Cause Diagnosis
+  app.post('/api/ai/diagnose', async (req, res) => {
+    const { context } = (req.body as { context?: SanitizedLogContext } | undefined) || {};
+    if (!context || (!context.excerpts?.length && !context.topPatterns?.length)) {
+      res.status(400).json({ error: '缺少可供分析的日志上下文' });
+      return;
+    }
+
+    const signal = createClientAbortSignal(res);
+    const contextText = buildServerLogContextText(context);
+    const nsArg = context.target?.namespace && !context.target?.isMultiPod ? `-n ${context.target.namespace}` : '-A';
+    const podName = context.target?.pod || '<pod-name>';
+    const containerArg = context.target?.container && !context.target?.isMultiPod ? ` -c ${context.target.container}` : '';
+
+    try {
+      const ai = getGeminiClient();
+      const callOnce = () =>
+        ai.models.generateContent({
+          model: AI_MODEL,
+          contents: `请对以下已脱敏的 Kubernetes 容器日志进行根因诊断：\n\n${contextText}`,
+          config: {
+            systemInstruction:
+              `你是一位资深 Kubernetes SRE 与云原生故障排障专家。请仅基于提供的日志证据进行客观、精准的中文根因诊断，绝不编造日志中不存在的错误。` +
+              `在输出 suggestedCommands 时，请优先结合目标上下文（如 ${nsArg}、Pod ${podName}${containerArg}）生成可直接复制执行的只读排查命令（如 kubectl describe pod、kubectl get events、kubectl top pod 等）。` +
+              `在 relatedLineNumbers 中仅填写日志片段中真实出现的行号整数（最多 5 个）。输出简洁专业，避免冗长套话。`,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                severity: {
+                  type: Type.STRING,
+                  description: '严重级别，仅允许 critical / warning / healthy 三选一',
+                },
+                summary: {
+                  type: Type.STRING,
+                  description: '1-2 句话直击要害的中文故障结论摘要',
+                },
+                rootCauses: {
+                  type: Type.ARRAY,
+                  description: '按可能性从高到低排列的 1-4 个疑似根因',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      title: { type: Type.STRING, description: '简明根因标题' },
+                      confidence: { type: Type.STRING, description: 'high / medium / low' },
+                      evidence: { type: Type.STRING, description: '基于日志内容的具体证据说明' },
+                      relatedLineNumbers: {
+                        type: Type.ARRAY,
+                        items: { type: Type.INTEGER },
+                        description: '日志中对应的原始行号列表',
+                      },
+                    },
+                    required: ['title', 'confidence', 'evidence', 'relatedLineNumbers'],
+                  },
+                },
+                suggestedCommands: {
+                  type: Type.ARRAY,
+                  description: '2-4 条推荐立即执行的只读 kubectl 或诊断命令',
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      description: { type: Type.STRING, description: '命令用途说明' },
+                      command: { type: Type.STRING, description: '可直接执行的完整命令' },
+                    },
+                    required: ['description', 'command'],
+                  },
+                },
+                nextSteps: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: '2-4 条按优先级排列的止血与修复建议',
+                },
+              },
+              required: ['severity', 'summary', 'rootCauses', 'suggestedCommands', 'nextSteps'],
+            },
+          },
+        });
+
+      let response;
+      try {
+        response = await callOnce();
+      } catch (firstErr) {
+        const msg = firstErr instanceof Error ? firstErr.message : '';
+        if (!signal.aborted && /503|500|UNAVAILABLE|fetch failed|ECONNRESET/i.test(msg)) {
+          await new Promise((r) => setTimeout(r, 800));
+          response = await callOnce();
+        } else {
+          throw firstErr;
+        }
+      }
+
+      if (signal.aborted || res.writableEnded) return;
+      const rawJson = (response.text ?? '').trim();
+      const parsed = safeJsonParse<AiDiagnosisReport>(rawJson, 'AI 诊断模型');
+
+      const report: AiDiagnosisReport = {
+        severity:
+          parsed.severity === 'critical' || parsed.severity === 'warning' || parsed.severity === 'healthy'
+            ? parsed.severity
+            : 'warning',
+        summary: typeof parsed.summary === 'string' ? parsed.summary : '已完成日志分析。',
+        rootCauses: Array.isArray(parsed.rootCauses)
+          ? parsed.rootCauses.slice(0, 5).map((rc) => ({
+              title: String(rc.title || '疑似异常'),
+              confidence:
+                rc.confidence === 'high' || rc.confidence === 'medium' || rc.confidence === 'low'
+                  ? rc.confidence
+                  : 'medium',
+              evidence: String(rc.evidence || ''),
+              relatedLineNumbers: Array.isArray(rc.relatedLineNumbers)
+                ? rc.relatedLineNumbers.filter((n) => Number.isInteger(n) && n > 0).slice(0, 6)
+                : [],
+            }))
+          : [],
+        suggestedCommands: Array.isArray(parsed.suggestedCommands)
+          ? parsed.suggestedCommands
+              .slice(0, 5)
+              .filter((c) => c && typeof c.command === 'string' && c.command.trim())
+              .map((c) => ({
+                description: String(c.description || '排查命令'),
+                command: c.command.trim(),
+              }))
+          : [],
+        nextSteps: Array.isArray(parsed.nextSteps)
+          ? parsed.nextSteps.slice(0, 6).map((s) => String(s))
+          : [],
+      };
+
+      res.json({ report });
+    } catch (err) {
+      if (signal.aborted || res.writableEnded) return;
+      const { status, message } = formatGeminiError(err);
+      res.status(status).json({ error: message });
+    }
+  });
+
+  // AI Route 2: Single Entry & Stacktrace Streaming Explanation (SSE)
+  app.post('/api/ai/explain', async (req, res) => {
+    const { payload } = (req.body as { payload?: AiEntryExplainPayload } | undefined) || {};
+    if (!payload?.entry) {
+      res.status(400).json({ error: '缺少目标日志行数据' });
+      return;
+    }
+
+    let ai: GoogleGenAI;
+    try {
+      ai = getGeminiClient();
+    } catch (err) {
+      const { status, message } = formatGeminiError(err);
+      res.status(status).json({ error: message });
+      return;
+    }
+
+    const signal = createClientAbortSignal(res);
+    const e = payload.entry;
+    const surroundingText = Array.isArray(payload.surroundingLines) && payload.surroundingLines.length > 0
+      ? payload.surroundingLines
+          .map(
+            (l) =>
+              `#${Number(l.lineNumber) || 0} [${sanitizeStringServerSide(l.timeDisplay, 32)}] [${l.level}] ${sanitizeStringServerSide(l.message, 320)}`
+          )
+          .join('\n')
+      : '（无相邻行）';
+
+    const promptText = [
+      `目标容器: ${sanitizeStringServerSide(e.namespace, 120)} / ${sanitizeStringServerSide(e.pod, 180)} : ${sanitizeStringServerSide(e.container, 120)}`,
+      `目标日志行: #${Number(e.lineNumber) || 0} [${e.level}] ${sanitizeStringServerSide(e.timestampIso, 64)}`,
+      `消息内容:\n${sanitizeStringServerSide(e.message, 1200)}`,
+      e.jsonFields ? `\n结构化字段:\n${sanitizeStringServerSide(e.jsonFields, 2000)}` : '',
+      e.stackTrace ? `\n异常堆栈:\n${sanitizeStringServerSide(e.stackTrace, 3500)}` : '',
+      `\n前后相邻上下文:\n${surroundingText}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    try {
+      const stream = await ai.models.generateContentStream({
+        model: AI_MODEL,
+        contents: `请深度解读以下单条 Kubernetes 容器日志及其堆栈与相邻上下文：\n\n${promptText}`,
+        config: {
+          systemInstruction:
+            '你是一位 Kubernetes 与后端系统排障专家。请使用简洁、结构化的中文 Markdown 解读这条日志，按以下 4 点组织：1) 这条日志在说什么；2) 直接原因与堆栈关键帧解读（如有堆栈）；3) 结合前后文的影响评估；4) 具体排查步骤或可执行的 kubectl 命令。引用上下文行号时使用 #行号 格式（如 #42），避免冗长废话。',
+        },
+      });
+
+      for await (const chunk of stream) {
+        if (signal.aborted || res.writableEnded) break;
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
+      }
+
+      if (!signal.aborted && !res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    } catch (err) {
+      if (!signal.aborted && !res.writableEnded) {
+        const { message } = formatGeminiError(err);
+        res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    }
+  });
+
+  // AI Route 3: Multi-Turn Contextual Q&A (SSE)
+  app.post('/api/ai/chat', async (req, res) => {
+    const { context, messages } =
+      (req.body as {
+        context?: SanitizedLogContext;
+        messages?: Array<{ role: 'user' | 'assistant'; content: string }>;
+      } | undefined) || {};
+
+    if (!context || !Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json({ error: '缺少对话内容或日志上下文' });
+      return;
+    }
+
+    let ai: GoogleGenAI;
+    try {
+      ai = getGeminiClient();
+    } catch (err) {
+      const { status, message } = formatGeminiError(err);
+      res.status(status).json({ error: message });
+      return;
+    }
+
+    const signal = createClientAbortSignal(res);
+    const contextText = buildServerLogContextText(context);
+
+    // Keep last 12 turns and ensure strictly redacted text
+    const trimmedHistory = messages
+      .slice(-12)
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
+      .map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: sanitizeStringServerSide(m.content, 3000) }],
+      }));
+
+    if (trimmedHistory.length === 0 || trimmedHistory[trimmedHistory.length - 1].role !== 'user') {
+      res.status(400).json({ error: '请提供有效的提问内容' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    try {
+      const stream = await ai.models.generateContentStream({
+        model: AI_MODEL,
+        contents: trimmedHistory,
+        config: {
+          systemInstruction:
+            `你是内置在 KubeLog Workbench 中的资深 Kubernetes SRE 排障助手。所有回答必须严格基于下方提供的脱敏容器日志上下文，切勿捏造不存在的日志行或报错。` +
+            `回答请使用清晰简洁的中文 Markdown；引用日志行时请使用 #行号 格式（如 #18），涉及 kubectl 命令时请使用 \`\`\`bash 代码块并尽量填好当前的 namespace/pod 参数。\n\n` +
+            `=== 当前容器脱敏日志上下文 ===\n${contextText}`,
+        },
+      });
+
+      for await (const chunk of stream) {
+        if (signal.aborted || res.writableEnded) break;
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
+      }
+
+      if (!signal.aborted && !res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    } catch (err) {
+      if (!signal.aborted && !res.writableEnded) {
+        const { message } = formatGeminiError(err);
+        res.write(`data: ${JSON.stringify({ error: message })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    }
+  });
 
   // Vite middleware for dev, static files for prod
   if (process.env.NODE_ENV !== 'production') {

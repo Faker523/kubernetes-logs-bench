@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AiAssistantPanel } from './components/AiAssistantPanel';
 import { ClusterConnectModal } from './components/ClusterConnectModal';
 import { LogDetailDrawer } from './components/LogDetailDrawer';
 import { LogHistogram } from './components/LogHistogram';
@@ -13,6 +14,7 @@ import {
   generateSandboxLiveLog,
   getSandboxLogs,
 } from './data/sandboxCluster';
+import type { AiEntryExplainPayload } from './types/ai';
 import type {
   ClusterConfig,
   FilterState,
@@ -24,6 +26,10 @@ import type {
 import { fetchNamespaces, fetchPodLogs, fetchPods } from './utils/k8sClient';
 import { exportLogsToFile, parseRawLogs } from './utils/logParser';
 import { aggregateLogPatterns } from './utils/logPatternDetector';
+import {
+  buildSanitizedEntryExplainPayload,
+  buildSanitizedLogContext,
+} from './utils/logRedactor';
 import {
   loadActiveCluster,
   loadDisplayPrefs,
@@ -163,15 +169,32 @@ export default function App() {
   }));
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [patternPanelOpen, setPatternPanelOpen] = useState(false);
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [aiAutoDiagnoseSeq, setAiAutoDiagnoseSeq] = useState(0);
+  const [aiExplainRequest, setAiExplainRequest] = useState<{
+    seq: number;
+    payload: AiEntryExplainPayload;
+  } | null>(null);
+  const [jumpToLineRequest, setJumpToLineRequest] = useState<{
+    lineNumber: number;
+    seq: number;
+  } | null>(null);
   const [excludedPatternIds, setExcludedPatternIds] = useState<string[]>([]);
   const [focusedPatternId, setFocusedPatternId] = useState<string | null>(null);
 
   const importedEntriesRef = useRef<LogEntry[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const podsRef = useRef<PodInfo[]>(pods);
+  podsRef.current = pods;
   const podsAbortRef = useRef<AbortController | null>(null);
   const podsReqSeqRef = useRef(0);
   const logsAbortRef = useRef<AbortController | null>(null);
   const logsReqSeqRef = useRef(0);
+
+  const resolvePodNodeName = useCallback((namespace: string, podName: string): string | undefined => {
+    const matched = podsRef.current.find((p) => p.namespace === namespace && p.name === podName);
+    return matched?.nodeName || undefined;
+  }, []);
 
   // Sync theme class on <html> and persist
   useEffect(() => {
@@ -237,13 +260,14 @@ export default function App() {
         searchInputRef.current?.focus();
       } else if (e.key === 'Escape') {
         if (connectModalOpen) setConnectModalOpen(false);
+        else if (aiPanelOpen) setAiPanelOpen(false);
         else if (selectedEntryId) setSelectedEntryId(null);
         else if (patternPanelOpen) setPatternPanelOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [connectModalOpen, selectedEntryId, patternPanelOpen]);
+  }, [connectModalOpen, aiPanelOpen, selectedEntryId, patternPanelOpen]);
 
   const loadPodsForCluster = useCallback(
     async (activeCluster: ClusterConfig, ns: string, fetchNsList = true) => {
@@ -451,7 +475,12 @@ export default function App() {
             );
             return parseRawLogs(
               raw,
-              { namespace: item.namespace, pod: item.pod, container: item.container },
+              {
+                namespace: item.namespace,
+                pod: item.pod,
+                container: item.container,
+                nodeName: resolvePodNodeName(item.namespace, item.pod),
+              },
               `${item.pod}-${item.container}`
             );
           })
@@ -487,6 +516,7 @@ export default function App() {
             namespace: selectedTarget.namespace,
             pod: selectedTarget.pod,
             container: selectedTarget.container,
+            nodeName: resolvePodNodeName(selectedTarget.namespace, selectedTarget.pod),
           },
           `${selectedTarget.pod}-${selectedTarget.container}`
         );
@@ -505,7 +535,7 @@ export default function App() {
         setIsLoadingLogs(false);
       }
     }
-  }, [cluster, podsVerifiedClusterId, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines]);
+  }, [cluster, podsVerifiedClusterId, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines, resolvePodNodeName]);
 
   useEffect(() => {
     loadLogs();
@@ -569,7 +599,12 @@ export default function App() {
                 );
                 return parseRawLogs(
                   raw,
-                  { namespace: item.namespace, pod: item.pod, container: item.container },
+                  {
+                    namespace: item.namespace,
+                    pod: item.pod,
+                    container: item.container,
+                    nodeName: resolvePodNodeName(item.namespace, item.pod),
+                  },
                   `${item.pod}-${item.container}`
                 );
               })
@@ -602,6 +637,7 @@ export default function App() {
                   namespace: selectedTarget.namespace,
                   pod: selectedTarget.pod,
                   container: selectedTarget.container,
+                  nodeName: resolvePodNodeName(selectedTarget.namespace, selectedTarget.pod),
                 },
                 `${selectedTarget.pod}-${selectedTarget.container}`
               );
@@ -624,7 +660,7 @@ export default function App() {
         controller?.abort();
       };
     }
-  }, [isLiveTail, cluster, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines]);
+  }, [isLiveTail, cluster, isMultiPodMode, multiPodSelection, selectedTarget, filters.tailLines, resolvePodNodeName]);
 
   // Compute level counts from rawEntries
   const levelCounts = useMemo(() => {
@@ -767,14 +803,99 @@ export default function App() {
     };
   }, [rawEntries, filters, patternEntryFilters]);
 
-  const selectedEntry = useMemo(
-    () => visibleEntries.find((e) => e.id === selectedEntryId) || null,
-    [visibleEntries, selectedEntryId]
-  );
+  const selectedEntry = useMemo(() => {
+    const found = visibleEntries.find((e) => e.id === selectedEntryId) || null;
+    if (!found) return null;
+    if (found.nodeName && found.nodeName !== '-') return found;
+    const podMeta = pods.find((p) => p.namespace === found.namespace && p.name === found.pod);
+    if (podMeta?.nodeName) {
+      return { ...found, nodeName: podMeta.nodeName };
+    }
+    return found;
+  }, [visibleEntries, selectedEntryId, pods]);
 
   const selectedEntryIndex = useMemo(
     () => (selectedEntryId ? visibleEntries.findIndex((e) => e.id === selectedEntryId) : -1),
     [visibleEntries, selectedEntryId]
+  );
+
+  const viewKey = isMultiPodMode
+    ? `${cluster.id}|multi|${multiPodSelection.map((i) => `${i.namespace}/${i.pod}/${i.container}`).join(',')}`
+    : `${cluster.id}|single|${selectedTarget ? `${selectedTarget.namespace}/${selectedTarget.pod}/${selectedTarget.container}/${selectedTarget.previous}` : 'none'}`;
+
+  const sanitizedAiContext = useMemo(
+    () =>
+      buildSanitizedLogContext({
+        cluster,
+        selectedTarget,
+        isMultiPodMode,
+        multiPodCount: multiPodSelection.length,
+        rawEntries,
+        visibleEntries,
+        levelCounts,
+        patterns: patternAggregation.patterns,
+      }),
+    [
+      cluster,
+      selectedTarget,
+      isMultiPodMode,
+      multiPodSelection.length,
+      rawEntries,
+      visibleEntries,
+      levelCounts,
+      patternAggregation.patterns,
+    ]
+  );
+
+  const handleAnalyzeAlertsWithAi = useCallback(() => {
+    setPatternPanelOpen(false);
+    setAiPanelOpen(true);
+    setAiAutoDiagnoseSeq((n) => n + 1);
+  }, []);
+
+  const handleExplainEntryWithAi = useCallback(
+    (entry: LogEntry) => {
+      const payload = buildSanitizedEntryExplainPayload({
+        cluster,
+        selectedTarget,
+        isMultiPodMode,
+        multiPodCount: multiPodSelection.length,
+        entry,
+        allEntries: rawEntries,
+      });
+      setPatternPanelOpen(false);
+      setAiPanelOpen(true);
+      setAiExplainRequest((prev) => ({ seq: (prev?.seq ?? 0) + 1, payload }));
+    },
+    [cluster, selectedTarget, isMultiPodMode, multiPodSelection.length, rawEntries]
+  );
+
+  const handleJumpToLine = useCallback(
+    (lineNumber: number) => {
+      const inVisible = visibleEntries.find((e) => e.lineNumber === lineNumber);
+      if (inVisible) {
+        setSelectedEntryId(inVisible.id);
+        setJumpToLineRequest((prev) => ({ lineNumber, seq: (prev?.seq ?? 0) + 1 }));
+        return;
+      }
+      const inRaw = rawEntries.find((e) => e.lineNumber === lineNumber);
+      if (inRaw) {
+        // Clear active filters so the referenced line becomes visible and highlighted
+        setExcludedPatternIds([]);
+        setFocusedPatternId(null);
+        setFilters((prev) => ({
+          ...INITIAL_FILTERS,
+          tailLines: prev.tailLines,
+          showTimestamp: prev.showTimestamp,
+          showLineNumbers: prev.showLineNumbers,
+          wrapLines: prev.wrapLines,
+          jsonPreview: prev.jsonPreview,
+        }));
+        setSelectedEntryId(inRaw.id);
+        setJumpToLineRequest((prev) => ({ lineNumber, seq: (prev?.seq ?? 0) + 1 }));
+      }
+    },
+    [visibleEntries, rawEntries]
   );
 
   const handleSelectNamespace = (ns: string) => {
@@ -860,6 +981,7 @@ export default function App() {
         namespace: payload.namespace,
         pod: payload.podName,
         container: payload.container,
+        nodeName: 'local-file',
       },
       'imported'
     );
@@ -1036,13 +1158,24 @@ export default function App() {
             onTogglePatternPanel={() => {
               setPatternPanelOpen((open) => {
                 const next = !open;
-                if (next) setSelectedEntryId(null);
+                if (next) {
+                  setAiPanelOpen(false);
+                  setSelectedEntryId(null);
+                }
                 return next;
               });
             }}
             onClearPatternFilters={() => {
               setExcludedPatternIds([]);
               setFocusedPatternId(null);
+            }}
+            aiPanelOpen={aiPanelOpen}
+            onToggleAiPanel={() => {
+              setAiPanelOpen((open) => {
+                const next = !open;
+                if (next) setPatternPanelOpen(false);
+                return next;
+              });
             }}
           />
 
@@ -1067,11 +1200,7 @@ export default function App() {
           />
 
           <LogViewport
-            viewKey={
-              isMultiPodMode
-                ? `${cluster.id}|multi|${multiPodSelection.map((i) => `${i.namespace}/${i.pod}/${i.container}`).join(',')}`
-                : `${cluster.id}|single|${selectedTarget ? `${selectedTarget.namespace}/${selectedTarget.pod}/${selectedTarget.container}/${selectedTarget.previous}` : 'none'}`
-            }
+            viewKey={viewKey}
             entries={visibleEntries}
             totalCount={rawEntries.length}
             filters={filters}
@@ -1081,6 +1210,7 @@ export default function App() {
             selectedEntryId={selectedEntryId}
             onSelectEntry={(entry) => {
               setPatternPanelOpen(false);
+              setAiPanelOpen(false);
               setSelectedEntryId((curr) => (curr === entry.id ? null : entry.id));
             }}
             isLiveTail={isLiveTail}
@@ -1103,57 +1233,74 @@ export default function App() {
               }
             }}
             contextMatchIds={contextMatchIds}
+            onAnalyzeAlertsWithAi={handleAnalyzeAlertsWithAi}
+            jumpToLineRequest={jumpToLineRequest}
           />
         </main>
 
-        {patternPanelOpen ? (
-          <LogPatternPanel
-            patterns={patternAggregation.patterns}
-            totalEntries={patternAggregation.totalEntries}
-            compressionPct={patternAggregation.compressionPct}
-            excludedPatternIds={excludedPatternIds}
-            focusedPatternId={focusedPatternId}
-            onToggleExcludePattern={(id) => {
-              setFocusedPatternId(null);
-              setExcludedPatternIds((prev) =>
-                prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-              );
-            }}
-            onToggleFocusPattern={(id) => {
-              setFocusedPatternId((curr) => (curr === id ? null : id));
-            }}
-            onClearPatternFilters={() => {
-              setExcludedPatternIds([]);
-              setFocusedPatternId(null);
-            }}
-            onApplyRegexToSearch={(regex) => {
-              setFilters((prev) => ({
-                ...prev,
-                search: regex,
-                isRegex: true,
-              }));
-            }}
-            onClose={() => setPatternPanelOpen(false)}
+        <div className={aiPanelOpen ? 'flex h-full shrink-0' : 'hidden'}>
+          <AiAssistantPanel
+            viewKey={viewKey}
+            context={sanitizedAiContext}
+            hasLogs={rawEntries.length > 0}
+            autoDiagnoseSeq={aiAutoDiagnoseSeq}
+            explainRequest={aiExplainRequest}
+            onJumpToLine={handleJumpToLine}
+            onClose={() => setAiPanelOpen(false)}
           />
-        ) : (
-          <LogDetailDrawer
-            entry={selectedEntry}
-            onClose={() => setSelectedEntryId(null)}
-            canPrev={selectedEntryIndex > 0}
-            canNext={selectedEntryIndex >= 0 && selectedEntryIndex < visibleEntries.length - 1}
-            onNavigate={(dir) => {
-              if (selectedEntryIndex < 0) return;
-              const nextIdx = dir === 'prev' ? selectedEntryIndex - 1 : selectedEntryIndex + 1;
-              const target = visibleEntries[nextIdx];
-              if (target) setSelectedEntryId(target.id);
-            }}
-            onApplyFieldFilter={(key, value, negate) =>
-              setFilters((prev) => ({
-                ...prev,
-                fieldFilter: { key, value, negate },
-              }))
-            }
-          />
+        </div>
+
+        {!aiPanelOpen && (
+          patternPanelOpen ? (
+            <LogPatternPanel
+              patterns={patternAggregation.patterns}
+              totalEntries={patternAggregation.totalEntries}
+              compressionPct={patternAggregation.compressionPct}
+              excludedPatternIds={excludedPatternIds}
+              focusedPatternId={focusedPatternId}
+              onToggleExcludePattern={(id) => {
+                setFocusedPatternId(null);
+                setExcludedPatternIds((prev) =>
+                  prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+                );
+              }}
+              onToggleFocusPattern={(id) => {
+                setFocusedPatternId((curr) => (curr === id ? null : id));
+              }}
+              onClearPatternFilters={() => {
+                setExcludedPatternIds([]);
+                setFocusedPatternId(null);
+              }}
+              onApplyRegexToSearch={(regex) => {
+                setFilters((prev) => ({
+                  ...prev,
+                  search: regex,
+                  isRegex: true,
+                }));
+              }}
+              onClose={() => setPatternPanelOpen(false)}
+            />
+          ) : (
+            <LogDetailDrawer
+              entry={selectedEntry}
+              onClose={() => setSelectedEntryId(null)}
+              canPrev={selectedEntryIndex > 0}
+              canNext={selectedEntryIndex >= 0 && selectedEntryIndex < visibleEntries.length - 1}
+              onNavigate={(dir) => {
+                if (selectedEntryIndex < 0) return;
+                const nextIdx = dir === 'prev' ? selectedEntryIndex - 1 : selectedEntryIndex + 1;
+                const target = visibleEntries[nextIdx];
+                if (target) setSelectedEntryId(target.id);
+              }}
+              onApplyFieldFilter={(key, value, negate) =>
+                setFilters((prev) => ({
+                  ...prev,
+                  fieldFilter: { key, value, negate },
+                }))
+              }
+              onExplainWithAi={handleExplainEntryWithAi}
+            />
+          )
         )}
       </div>
 

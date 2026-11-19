@@ -1,4 +1,4 @@
-import { Layers, Pause, Play, RefreshCw, Search, X } from 'lucide-react';
+import { Layers, Pause, Play, RefreshCw, Search, Sparkles, X } from 'lucide-react';
 import { useRef } from 'react';
 import type { FilterState, LogLevel } from '../types/k8s';
 
@@ -18,6 +18,8 @@ interface LogToolbarProps {
   focusedPatternActive: boolean;
   onTogglePatternPanel: () => void;
   onClearPatternFilters: () => void;
+  aiPanelOpen: boolean;
+  onToggleAiPanel: () => void;
 }
 
 export function LogToolbar({
@@ -36,6 +38,8 @@ export function LogToolbar({
   focusedPatternActive,
   onTogglePatternPanel,
   onClearPatternFilters,
+  aiPanelOpen,
+  onToggleAiPanel,
 }: LogToolbarProps) {
   const excludeInputRef = useRef<HTMLInputElement>(null);
 
@@ -297,6 +301,19 @@ export function LogToolbar({
           >
             <Layers className="w-3.5 h-3.5" />
             <span>模式检测 ({patternCount})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onToggleAiPanel}
+            className={`h-7 px-2.5 rounded text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 border ${
+              aiPanelOpen
+                ? 'border-sky-500 bg-sky-600 text-white'
+                : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>AI 诊断</span>
           </button>
         </div>
       </div>

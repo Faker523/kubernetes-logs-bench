@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronUp, Copy, Filter, FilterX, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Copy, Filter, FilterX, Sparkles, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { LogEntry } from '../types/k8s';
 import { copyTextToClipboard } from '../utils/clipboard';
@@ -10,6 +10,7 @@ interface LogDetailDrawerProps {
   canPrev: boolean;
   canNext: boolean;
   onApplyFieldFilter: (key: string, value: string, negate?: boolean) => void;
+  onExplainWithAi: (entry: LogEntry) => void;
 }
 
 export function LogDetailDrawer({
@@ -19,6 +20,7 @@ export function LogDetailDrawer({
   canPrev,
   canNext,
   onApplyFieldFilter,
+  onExplainWithAi,
 }: LogDetailDrawerProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const copyTimerRef = useRef<number | null>(null);
@@ -63,6 +65,15 @@ export function LogDetailDrawer({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={() => onExplainWithAi(entry)}
+            title="脱敏后交由 AI 深度解读该条日志与堆栈"
+            className="h-7 px-2 mr-1 inline-flex items-center gap-1 rounded border border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20 text-[11px] font-medium text-sky-700 dark:text-sky-300 transition-colors whitespace-nowrap"
+          >
+            <Sparkles className="w-3 h-3" />
+            <span>AI 解读此行</span>
+          </button>
           <button
             type="button"
             disabled={!canPrev}
@@ -116,7 +127,9 @@ export function LogDetailDrawer({
             {entry.nodeName && (
               <>
                 <dt className="text-slate-500 dark:text-slate-400">节点</dt>
-                <dd className="font-mono text-slate-800 dark:text-slate-200">{entry.nodeName}</dd>
+                <dd className="font-mono text-slate-800 dark:text-slate-200 break-all">
+                  {entry.nodeName === '-' ? '未调度 (-)' : entry.nodeName}
+                </dd>
               </>
             )}
 

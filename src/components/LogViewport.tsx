@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowDown, ChevronDown, ChevronRight, FileText, RotateCcw, X } from 'lucide-react';
+import { AlertTriangle, ArrowDown, ChevronDown, ChevronRight, FileText, RotateCcw, Sparkles, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FilterState, LogEntry, LogLevel } from '../types/k8s';
 
@@ -16,6 +16,8 @@ interface LogViewportProps {
   onResetFilters: () => void;
   onRetry: () => void;
   contextMatchIds?: Set<string>;
+  onAnalyzeAlertsWithAi?: () => void;
+  jumpToLineRequest?: { lineNumber: number; seq: number } | null;
 }
 
 const POD_TEXT_COLORS = [
@@ -135,6 +137,8 @@ export function LogViewport({
   onResetFilters,
   onRetry,
   contextMatchIds,
+  onAnalyzeAlertsWithAi,
+  jumpToLineRequest,
 }: LogViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -159,6 +163,17 @@ export function LogViewport({
       containerRef.current.scrollTop = 0;
     }
   }, [viewKey]);
+
+  // Support jumping directly to a referenced line number from AI diagnosis / chat
+  useEffect(() => {
+    if (!jumpToLineRequest) return;
+    const target = entries.find((e) => e.lineNumber === jumpToLineRequest.lineNumber);
+    if (!target) return;
+    const rowEl = rowRefs.current.get(target.id);
+    if (rowEl) {
+      rowEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [jumpToLineRequest, entries]);
 
   const alertDetection = useMemo(() => {
     const matchedEntries: LogEntry[] = [];
@@ -356,6 +371,16 @@ export function LogViewport({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {onAnalyzeAlertsWithAi && (
+              <button
+                type="button"
+                onClick={onAnalyzeAlertsWithAi}
+                className="px-2 py-0.5 rounded border border-red-400/70 dark:border-red-700 bg-white/80 dark:bg-red-950/50 hover:bg-white dark:hover:bg-red-900/60 text-red-700 dark:text-red-200 text-[11px] font-medium inline-flex items-center gap-1 transition-colors whitespace-nowrap"
+              >
+                <Sparkles className="w-3 h-3" />
+                <span>AI 分析异常</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={jumpToAlertMatch}
