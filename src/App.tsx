@@ -376,17 +376,24 @@ export default function App() {
 
   const loadLogs = useCallback(async () => {
     if (cluster.mode === 'k8s-api' && podsVerifiedClusterId !== cluster.id) {
+      setIsLoadingLogs(false);
       return;
     }
 
     setLogError(null);
 
     if (cluster.mode === 'imported-file') {
+      logsAbortRef.current?.abort();
+      logsReqSeqRef.current += 1;
+      setIsLoadingLogs(false);
       setRawEntries(importedEntriesRef.current);
       return;
     }
 
     if (cluster.mode === 'sandbox') {
+      logsAbortRef.current?.abort();
+      logsReqSeqRef.current += 1;
+      setIsLoadingLogs(false);
       if (isMultiPodMode) {
         const merged: LogEntry[] = [];
         for (const item of multiPodSelection) {
@@ -505,6 +512,7 @@ export default function App() {
     setSelectedEntryId(null);
     setExcludedPatternIds([]);
     setFocusedPatternId(null);
+    setFilters((prev) => (prev.timeBucketRange ? { ...prev, timeBucketRange: null } : prev));
   }, [loadLogs]);
 
   // Live Tail polling / simulation
@@ -543,7 +551,7 @@ export default function App() {
       const pollOnce = async () => {
         if (cancelled) return;
         controller = new AbortController();
-        const tail = filters.tailLines > 0 ? filters.tailLines : 500;
+        const tail = filters.tailLines > 0 ? filters.tailLines : 5000;
         try {
           if (isMultiPodMode) {
             const settled = await Promise.allSettled(
@@ -777,34 +785,45 @@ export default function App() {
   };
 
   const handleConnectK8sCluster = (nextCluster: ClusterConfig, remember = true) => {
+    const normalizedCluster: ClusterConfig = {
+      ...nextCluster,
+      apiServer: nextCluster.apiServer?.trim().replace(/\/+$/, ''),
+    };
     podsAbortRef.current?.abort();
     logsAbortRef.current?.abort();
+    podsReqSeqRef.current += 1;
+    logsReqSeqRef.current += 1;
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setIsLoadingLogs(false);
     setMultiPodSelection([]);
     setSelectedTarget(null);
-    saveSelectedTarget(nextCluster.id, null);
+    saveSelectedTarget(normalizedCluster.id, null);
     setPodsVerifiedClusterId(null);
     setHasAllPodsSnapshot(false);
     setSelectedEntryId(null);
+    setExcludedPatternIds([]);
+    setFocusedPatternId(null);
+    setFilters((prev) => ({ ...prev, fieldFilter: null, timeBucketRange: null }));
     setNamespaces([]);
     setPods([]);
     setRawEntries([]);
     setLogError(null);
-    setCluster(nextCluster);
+    setCluster(normalizedCluster);
     setSelectedNamespace('__all__');
 
     if (remember) {
-      saveActiveCluster(nextCluster);
+      saveActiveCluster(normalizedCluster);
+      const normUrl = (u?: string) => (u || '').trim().replace(/\/+$/, '');
       setSavedClusters((prev) => {
-        const filtered = prev.filter((c) => c.apiServer !== nextCluster.apiServer);
-        return [nextCluster, ...filtered].slice(0, 10);
+        const filtered = prev.filter((c) => normUrl(c.apiServer) !== normUrl(normalizedCluster.apiServer));
+        return [normalizedCluster, ...filtered].slice(0, 10);
       });
     } else {
       saveActiveCluster(null);
     }
 
-    loadPodsForCluster(nextCluster, '__all__', true);
+    loadPodsForCluster(normalizedCluster, '__all__', true);
   };
 
   const handleDeleteSavedCluster = (clusterId: string) => {
@@ -823,8 +842,15 @@ export default function App() {
   }) => {
     podsAbortRef.current?.abort();
     logsAbortRef.current?.abort();
+    podsReqSeqRef.current += 1;
+    logsReqSeqRef.current += 1;
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setMultiPodSelection([]);
+    setSelectedEntryId(null);
+    setExcludedPatternIds([]);
+    setFocusedPatternId(null);
+    setFilters((prev) => ({ ...prev, fieldFilter: null, timeBucketRange: null }));
     setIsLoadingPods(false);
     setIsLoadingLogs(false);
     setLogError(null);
@@ -881,8 +907,18 @@ export default function App() {
   const handleSwitchToSandbox = () => {
     podsAbortRef.current?.abort();
     logsAbortRef.current?.abort();
+    podsReqSeqRef.current += 1;
+    logsReqSeqRef.current += 1;
     setIsLiveTail(false);
     setIsMultiPodMode(false);
+    setMultiPodSelection([
+      { namespace: 'prod-ecommerce', pod: 'order-api-7f9d8c4b2-x9k2p', container: 'app' },
+      { namespace: 'prod-ecommerce', pod: 'payment-worker-5c6b89d74-m4n1q', container: 'worker' },
+    ]);
+    setSelectedEntryId(null);
+    setExcludedPatternIds([]);
+    setFocusedPatternId(null);
+    setFilters((prev) => ({ ...prev, fieldFilter: null, timeBucketRange: null }));
     setIsLoadingPods(false);
     setIsLoadingLogs(false);
     setLogError(null);
@@ -1031,6 +1067,11 @@ export default function App() {
           />
 
           <LogViewport
+            viewKey={
+              isMultiPodMode
+                ? `${cluster.id}|multi|${multiPodSelection.map((i) => `${i.namespace}/${i.pod}/${i.container}`).join(',')}`
+                : `${cluster.id}|single|${selectedTarget ? `${selectedTarget.namespace}/${selectedTarget.pod}/${selectedTarget.container}/${selectedTarget.previous}` : 'none'}`
+            }
             entries={visibleEntries}
             totalCount={rawEntries.length}
             filters={filters}

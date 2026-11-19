@@ -93,9 +93,10 @@ export function ClusterConnectModal({
     clientCert?: string;
     clientKey?: string;
     insecureTls?: boolean;
+    warning?: string;
   }) => {
     if (parsed.name) setClusterName(parsed.name);
-    if (parsed.apiServer) setApiServer(parsed.apiServer);
+    if (parsed.apiServer) setApiServer(parsed.apiServer.trim().replace(/\/+$/, ''));
     setToken(parsed.token || '');
     setCaCert(parsed.caCert || '');
     setClientCert(parsed.clientCert || '');
@@ -113,6 +114,8 @@ export function ClusterConnectModal({
 
     if (authKinds.length > 0) {
       setTestSuccess(`已解析集群地址与凭据 (${authKinds.join(' + ')})，请点击“测试并连接”。`);
+    } else if (parsed.warning) {
+      setTestError(parsed.warning);
     } else {
       setTestError('已提取 API Server 地址，但未在 kubeconfig 中找到 token 或 client-certificate-data / client-key-data。');
     }
@@ -197,6 +200,7 @@ export function ClusterConnectModal({
       }
     }
 
+    effectiveServer = effectiveServer.replace(/\/+$/, '');
     if (!effectiveServer) {
       setTestError('请填写 Kubernetes API Server 地址');
       return;
@@ -243,6 +247,10 @@ export function ClusterConnectModal({
 
   const handleFileUpload = (file: File) => {
     setImportError(null);
+    if (file.size > 25 * 1024 * 1024) {
+      setImportError('日志文件超过 25MB 上限，请截取关键时间段后再导入以保证浏览器流畅解析。');
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       const text = typeof reader.result === 'string' ? reader.result : '';
@@ -273,7 +281,14 @@ export function ClusterConnectModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/65 backdrop-blur-[2px]">
+    <div
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !testing) {
+          onClose();
+        }
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/65 backdrop-blur-[2px]"
+    >
       <div
         role="dialog"
         aria-modal="true"
@@ -338,8 +353,10 @@ export function ClusterConnectModal({
                   </div>
                   <div className="divide-y divide-slate-200 dark:divide-slate-800 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-[#0B0F17]">
                     {savedClusters.map((item) => {
+                      const norm = (u?: string) => (u || '').trim().replace(/\/+$/, '');
                       const isCurrent =
-                        activeCluster.mode === 'k8s-api' && activeCluster.apiServer === item.apiServer;
+                        activeCluster.mode === 'k8s-api' &&
+                        norm(activeCluster.apiServer) === norm(item.apiServer);
                       return (
                         <div
                           key={item.id}
@@ -423,6 +440,7 @@ export function ClusterConnectModal({
                       className="hidden"
                       onChange={(e) => {
                         const file = e.target.files?.[0];
+                        e.target.value = '';
                         if (!file) return;
                         const r = new FileReader();
                         r.onload = () => {
@@ -616,6 +634,7 @@ export function ClusterConnectModal({
                   className="hidden"
                   onChange={(e) => {
                     const f = e.target.files?.[0];
+                    e.target.value = '';
                     if (f) handleFileUpload(f);
                   }}
                 />

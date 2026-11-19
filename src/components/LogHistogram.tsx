@@ -1,5 +1,5 @@
 import { BarChart2, X } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LogEntry, LogLevel } from '../types/k8s';
 import { formatTimeDisplay } from '../utils/logParser';
 import { type HistogramBucket, HistogramTrendPopover } from './HistogramTrendPopover';
@@ -20,6 +20,7 @@ export function LogHistogram({
   onToggleLevelFilter,
 }: LogHistogramProps) {
   const [panelOpen, setPanelOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
 
   const { buckets, maxTotal } = useMemo(() => {
     if (entries.length === 0) return { buckets: [] as HistogramBucket[], maxTotal: 0 };
@@ -91,6 +92,26 @@ export function LogHistogram({
     }
   }, [activeRange]);
 
+  useEffect(() => {
+    if (!panelOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setPanelOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPanelOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [panelOpen]);
+
   if (entries.length < 2) return null;
 
   const anchorPercent = activeBucket
@@ -98,7 +119,7 @@ export function LogHistogram({
     : 50;
 
   return (
-    <div className="relative shrink-0 border-b border-slate-200 dark:border-slate-800/90 bg-slate-50/80 dark:bg-[#0D121C] px-4 py-2">
+    <div ref={wrapperRef} className="relative shrink-0 border-b border-slate-200 dark:border-slate-800/90 bg-slate-50/80 dark:bg-[#0D121C] px-4 py-2">
       <div className="flex items-center justify-between gap-4 mb-1.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono">
         <span>
           时间分布 ({formatTimeDisplay(buckets[0].startMs)} – {formatTimeDisplay(buckets[buckets.length - 1].endMs)})

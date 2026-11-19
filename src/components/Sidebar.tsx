@@ -61,10 +61,12 @@ export function Sidebar({
       if (selectedNamespace !== '__all__' && pod.namespace !== selectedNamespace) {
         return false;
       }
-      if (statusFilter === 'running' && pod.phase !== 'Running') {
+      const isHealthyPhase =
+        pod.phase === 'Running' || pod.phase === 'Succeeded' || pod.phase === 'Completed';
+      if (statusFilter === 'running' && !isHealthyPhase) {
         return false;
       }
-      if (statusFilter === 'unhealthy' && (pod.phase === 'Running' || pod.phase === 'Succeeded')) {
+      if (statusFilter === 'unhealthy' && isHealthyPhase) {
         return false;
       }
       if (q) {
@@ -215,7 +217,7 @@ export function Sidebar({
 
       {/* Pod & Container List */}
       <div className="flex-1 overflow-y-auto log-scrollbar p-2 space-y-1">
-        {isLoadingPods && pods.length === 0 ? (
+        {isLoadingPods && filteredPods.length === 0 ? (
           <div className="space-y-2 p-1">
             {[1, 2, 3, 4].map((idx) => (
               <div key={idx} className="h-14 rounded-md bg-slate-200/60 dark:bg-slate-800/40 animate-pulse" />

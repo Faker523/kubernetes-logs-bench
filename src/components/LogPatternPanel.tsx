@@ -1,6 +1,7 @@
 import { Check, Copy, Eye, EyeOff, RotateCcw, Search, Sparkles, X } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LogLevel } from '../types/k8s';
+import { copyTextToClipboard } from '../utils/clipboard';
 import type { LogPattern } from '../utils/logPatternDetector';
 
 interface LogPatternPanelProps {
@@ -46,6 +47,15 @@ export function LogPatternPanel({
   const [patternQuery, setPatternQuery] = useState('');
   const [sortBy, setSortBy] = useState<'count' | 'severity'>('count');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   const filteredPatterns = useMemo(() => {
     const q = patternQuery.trim().toLowerCase();
@@ -80,13 +90,16 @@ export function LogPatternPanel({
   }, [patterns, excludedPatternIds]);
 
   const copyRegex = async (id: string, regex: string) => {
-    try {
-      await navigator.clipboard.writeText(regex);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 1500);
-    } catch {
-      // Ignore clipboard permission errors
+    const ok = await copyTextToClipboard(regex);
+    if (!ok) return;
+    setCopiedId(id);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
     }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedId(null);
+      copyTimerRef.current = null;
+    }, 1500);
   };
 
   return (

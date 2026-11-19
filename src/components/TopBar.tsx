@@ -1,5 +1,5 @@
 import { Download, Moon, PanelLeft, Plug, Sun } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ClusterConfig, SelectedTarget } from '../types/k8s';
 
 interface TopBarProps {
@@ -30,6 +30,15 @@ export function TopBar({
   onToggleTheme,
 }: TopBarProps) {
   const [exportMenuOpen, setExportMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setExportMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [exportMenuOpen]);
 
   return (
     <header className="h-14 shrink-0 border-b border-slate-200 dark:border-slate-800/90 bg-white dark:bg-[#0F141F] px-4 flex items-center justify-between gap-6">

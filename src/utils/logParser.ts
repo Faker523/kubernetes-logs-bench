@@ -269,11 +269,12 @@ export function exportLogsToFile(entries: LogEntry[], format: 'log' | 'json', fi
       .join('\n');
   }
 
+  const safePrefix = filenamePrefix.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '') || 'kubelog';
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${filenamePrefix}-${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
+  a.download = `${safePrefix}-${new Date().toISOString().replace(/[:.]/g, '-')}.${ext}`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

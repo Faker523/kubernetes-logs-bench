@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FilterState, LogEntry, LogLevel } from '../types/k8s';
 
 interface LogViewportProps {
+  viewKey: string;
   entries: LogEntry[];
   totalCount: number;
   filters: FilterState;
@@ -121,6 +122,7 @@ function formatJsonPreviewPairs(payload: Record<string, unknown>): Array<[string
 }
 
 export function LogViewport({
+  viewKey,
   entries,
   totalCount,
   filters,
@@ -143,6 +145,20 @@ export function LogViewport({
   const [expandedStacks, setExpandedStacks] = useState<Record<string, boolean>>({});
   const [dismissedCount, setDismissedCount] = useState<number | null>(null);
   const [matchCursor, setMatchCursor] = useState(0);
+
+  // Reset per-Pod UI state whenever the active target/cluster/mode changes
+  useEffect(() => {
+    setDismissedCount(null);
+    setMatchCursor(0);
+    setExpandedStacks({});
+    setAutoScroll(true);
+    setNewLogCountWhilePaused(0);
+    prevLenRef.current = 0;
+    prevLastSigRef.current = '';
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0;
+    }
+  }, [viewKey]);
 
   const alertDetection = useMemo(() => {
     const matchedEntries: LogEntry[] = [];

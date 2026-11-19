@@ -1,6 +1,7 @@
 import { Check, ChevronDown, ChevronUp, Copy, Filter, FilterX, X } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { LogEntry } from '../types/k8s';
+import { copyTextToClipboard } from '../utils/clipboard';
 
 interface LogDetailDrawerProps {
   entry: LogEntry | null;
@@ -20,17 +21,29 @@ export function LogDetailDrawer({
   onApplyFieldFilter,
 }: LogDetailDrawerProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   if (!entry) return null;
 
   const copyText = async (id: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 1500);
-    } catch {
-      // Ignore clipboard permission errors
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    setCopiedId(id);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
     }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopiedId(null);
+      copyTimerRef.current = null;
+    }, 1500);
   };
 
   const jsonEntries = entry.jsonPayload ? Object.entries(entry.jsonPayload) : [];

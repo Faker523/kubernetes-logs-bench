@@ -24,7 +24,7 @@ interface K8sHttpResponse {
   headers: http.IncomingHttpHeaders;
 }
 
-const keepAliveHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 15000, maxSockets: 16 });
 const httpsAgentCache = new Map<string, https.Agent>();
 
 function getHttpsAgent(config: K8sRequestConfig): https.Agent {
@@ -42,6 +42,7 @@ function getHttpsAgent(config: K8sRequestConfig): https.Agent {
 
   const agentOptions: https.AgentOptions = {
     keepAlive: true,
+    keepAliveMsecs: 15000,
     maxSockets: 16,
     rejectUnauthorized: !config.insecureTls,
   };
@@ -57,8 +58,50 @@ function getHttpsAgent(config: K8sRequestConfig): https.Agent {
   return agent;
 }
 
-function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpResponse> {
+interface K8sRequestOptions {
+  timeoutMs?: number;
+  maxBytes?: number;
+  signal?: AbortSignal;
+  disableKeepAlive?: boolean;
+}
+
+function createClientAbortSignal(res: express.Response): AbortSignal {
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+  });
+  return controller.signal;
+}
+
+function isRetryableSocketError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code || '';
+  const msg = err.message || '';
+  return (
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    msg.includes('socket hang up') ||
+    msg.includes('Premature close')
+  );
+}
+
+function k8sRequestOnce(
+  config: K8sRequestConfig,
+  apiPath: string,
+  opts: K8sRequestOptions = {}
+): Promise<K8sHttpResponse> {
+  const timeoutMs = opts.timeoutMs ?? 25000;
+  const maxBytes = opts.maxBytes ?? 20 * 1024 * 1024;
+  const signal = opts.signal;
+
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('请求已取消'));
+      return;
+    }
+
     let targetUrl: URL;
     try {
       const base = config.apiServer.replace(/\/+$/, '');
@@ -66,6 +109,45 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
     } catch {
       reject(new Error('无效的 Kubernetes API Server URL'));
       return;
+    }
+
+    let settled = false;
+    let hardTimer: NodeJS.Timeout | null = null;
+    let req: http.ClientRequest | null = null;
+    let incomingRes: http.IncomingMessage | null = null;
+
+    const cleanup = () => {
+      if (hardTimer) {
+        clearTimeout(hardTimer);
+        hardTimer = null;
+      }
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    };
+
+    const finish = (value: K8sHttpResponse) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      incomingRes?.destroy();
+      req?.destroy();
+      reject(err);
+    };
+
+    const onAbort = () => {
+      fail(new Error('客户端已取消请求'));
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
     }
 
     const isHttps = targetUrl.protocol === 'https:';
@@ -81,9 +163,9 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
       port: targetUrl.port || (isHttps ? 443 : 80),
       path: `${targetUrl.pathname}${targetUrl.search}`,
       method: 'GET',
-      headers,
-      timeout: 30000,
-      agent: isHttps ? getHttpsAgent(config) : keepAliveHttpAgent,
+      headers: opts.disableKeepAlive ? { ...headers, Connection: 'close' } : headers,
+      timeout: timeoutMs,
+      agent: opts.disableKeepAlive ? false : isHttps ? getHttpsAgent(config) : keepAliveHttpAgent,
     };
 
     if (isHttps) {
@@ -97,42 +179,88 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
       }
     }
 
-    const MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
+    hardTimer = setTimeout(() => {
+      fail(
+        new Error(
+          `拉取 Kubernetes 数据超时 (${Math.round(timeoutMs / 1000)}s)，可能是目标节点 kubelet 响应缓慢、网络不通或单次日志体积过大`
+        )
+      );
+    }, timeoutMs);
+
     const transport = isHttps ? https : http;
-    const req = transport.request(reqOptions, (res) => {
+    req = transport.request(reqOptions, (res) => {
+      incomingRes = res;
       const chunks: Buffer[] = [];
       let totalBytes = 0;
-      let abortedForSize = false;
 
       res.on('data', (chunk: Buffer) => {
+        if (settled) return;
         totalBytes += chunk.length;
-        if (totalBytes > MAX_RESPONSE_BYTES) {
-          abortedForSize = true;
-          req.destroy(new Error('Kubernetes API 响应体积超过 25MB 限制，请调小拉取行数 (tailLines)'));
+        if (totalBytes > maxBytes) {
+          fail(
+            new Error(
+              `Kubernetes API 响应体积超过 ${Math.round(maxBytes / (1024 * 1024))}MB 限制，请调小拉取行数 (tailLines) 后重试`
+            )
+          );
           return;
         }
         chunks.push(chunk);
       });
+
       res.on('end', () => {
-        if (abortedForSize) return;
-        resolve({
+        finish({
           status: res.statusCode ?? 500,
           body: Buffer.concat(chunks).toString('utf8'),
           headers: res.headers,
         });
       });
+
+      res.on('error', (err) => {
+        fail(err);
+      });
+
+      res.on('close', () => {
+        if (!settled && !res.complete) {
+          fail(new Error('Kubernetes API Server 提前中断了响应流（可能是容器正在重启或节点 kubelet 连接中断）'));
+        }
+      });
     });
 
     req.on('timeout', () => {
-      req.destroy(new Error('连接 Kubernetes API Server 超时 (30s)'));
+      fail(new Error(`连接 Kubernetes API Server 超时 (${Math.round(timeoutMs / 1000)}s)`));
     });
 
     req.on('error', (err) => {
-      reject(err);
+      fail(err);
     });
 
     req.end();
   });
+}
+
+async function k8sRequest(
+  config: K8sRequestConfig,
+  apiPath: string,
+  opts: K8sRequestOptions = {}
+): Promise<K8sHttpResponse> {
+  try {
+    return await k8sRequestOnce(config, apiPath, opts);
+  } catch (err) {
+    // Retry once with a fresh socket if a pooled keep-alive socket was closed server-side
+    if (!opts.disableKeepAlive && !opts.signal?.aborted && isRetryableSocketError(err)) {
+      return k8sRequestOnce(config, apiPath, { ...opts, disableKeepAlive: true });
+    }
+    throw err;
+  }
+}
+
+function safeJsonParse<T>(body: string, contextLabel: string): T {
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    const preview = body.trim().slice(0, 160);
+    throw new Error(`${contextLabel}返回的不是有效的 JSON 响应（可能命中了网关登录页或地址配置有误）: ${preview}`);
+  }
 }
 
 function extractConfigFromHeaders(req: express.Request): K8sRequestConfig | null {
@@ -229,6 +357,7 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
   clientCert?: string;
   clientKey?: string;
   insecureTls?: boolean;
+  warning?: string;
 } {
   const result: {
     name?: string;
@@ -238,6 +367,7 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
     clientCert?: string;
     clientKey?: string;
     insecureTls?: boolean;
+    warning?: string;
   } = {};
 
   const readFileIfAllowed = (filePath?: string): string | undefined => {
@@ -268,7 +398,9 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
       const user = (parsed.users || []).find((u: { name: string }) => u.name === userName) || parsed.users?.[0];
 
       result.name = currentCtxName || cluster?.name;
-      result.apiServer = cluster?.cluster?.server;
+      result.apiServer = typeof cluster?.cluster?.server === 'string'
+        ? cluster.cluster.server.trim().replace(/\/+$/, '')
+        : undefined;
       result.insecureTls = Boolean(cluster?.cluster?.['insecure-skip-tls-verify']);
       if (cluster?.cluster?.['certificate-authority-data']) {
         result.caCert = Buffer.from(cluster.cluster['certificate-authority-data'], 'base64').toString('utf8');
@@ -289,6 +421,9 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
         result.clientKey = Buffer.from(user.user['client-key-data'], 'base64').toString('utf8');
       } else if (user?.user?.['client-key']) {
         result.clientKey = readFileIfAllowed(user.user['client-key']);
+      }
+      if (!result.token && !(result.clientCert && result.clientKey) && (user?.user?.exec || user?.user?.['auth-provider'])) {
+        result.warning = '检测到该 kubeconfig 使用 exec / auth-provider 动态认证（如 EKS/GKE/OIDC），请通过 kubectl 获取临时 Bearer Token 后填入。';
       }
       return result;
     } catch {
@@ -336,7 +471,7 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
   else if (activeCluster?.name) result.name = activeCluster.name;
 
   const server = getField(clusterScope, /server:\s*["']?(https?:\/\/[^\s\r\n"']+)["']?/);
-  if (server) result.apiServer = server;
+  if (server) result.apiServer = server.replace(/\/+$/, '');
 
   const insecure = getField(clusterScope, /insecure-skip-tls-verify:\s*["']?(true|false)["']?/i);
   if (insecure) result.insecureTls = insecure.toLowerCase() === 'true';
@@ -377,12 +512,27 @@ function parseSimpleKubeconfig(raw: string, resolveLocalFiles = false): {
     if (loadedKey) result.clientKey = loadedKey;
   }
 
+  if (
+    !result.token &&
+    !(result.clientCert && result.clientKey) &&
+    /^\s*(exec|auth-provider):/m.test(userScope)
+  ) {
+    result.warning = '检测到该 kubeconfig 使用 exec / auth-provider 动态认证（如 EKS/GKE/OIDC），请通过 kubectl 获取临时 Bearer Token 后填入。';
+  }
+
   return result;
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
+  app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err && typeof err === 'object' && 'status' in err && (err as { status?: number }).status === 400) {
+      res.status(400).json({ error: '请求体不是有效的 JSON 格式' });
+      return;
+    }
+    next(err);
+  });
 
   // Check if host has local kubeconfig or in-cluster SA token
   app.get('/api/k8s/local-status', (_req, res) => {
@@ -468,21 +618,24 @@ async function startServer() {
   // Test K8s API connectivity and verify authentication
   app.post('/api/k8s/test', async (req, res) => {
     const config = req.body as K8sRequestConfig;
-    if (!config?.apiServer) {
+    if (!config?.apiServer?.trim()) {
       res.status(400).json({ error: '请填写 API Server 地址' });
       return;
     }
+    const signal = createClientAbortSignal(res);
     try {
-      const versionResp = await k8sRequest(config, '/version');
+      const versionResp = await k8sRequest(config, '/version', { timeoutMs: 15000, signal });
+      if (signal.aborted || res.writableEnded) return;
       if (versionResp.status >= 400) {
         res.status(versionResp.status).json({
-          error: `集群返回 HTTP ${versionResp.status}: ${versionResp.body.slice(0, 300)}`,
+          error: `集群返回 HTTP ${versionResp.status}: ${formatK8sError(versionResp.status, versionResp.body)}`,
         });
         return;
       }
 
       // Verify authenticated API access (since /version often allows system:anonymous)
-      const nsResp = await k8sRequest(config, '/api/v1/namespaces?limit=1');
+      const nsResp = await k8sRequest(config, '/api/v1/namespaces?limit=1', { timeoutMs: 15000, signal });
+      if (signal.aborted || res.writableEnded) return;
       if (nsResp.status === 401 || (nsResp.status === 403 && nsResp.body.includes('system:anonymous'))) {
         const isAnon = nsResp.body.includes('system:anonymous');
         res.status(nsResp.status).json({
@@ -494,17 +647,41 @@ async function startServer() {
       }
 
       let versionInfo: Record<string, string> = {};
+      let hasValidVersionJson = false;
       try {
-        versionInfo = JSON.parse(versionResp.body);
+        const parsed = JSON.parse(versionResp.body) as Record<string, unknown>;
+        if (parsed && typeof parsed === 'object' && ('gitVersion' in parsed || 'major' in parsed)) {
+          versionInfo = parsed as Record<string, string>;
+          hasValidVersionJson = true;
+        }
       } catch {
-        versionInfo = {};
+        hasValidVersionJson = false;
       }
+
+      let hasValidK8sNsJson = false;
+      try {
+        const parsedNs = JSON.parse(nsResp.body) as { kind?: string };
+        if (parsedNs && typeof parsedNs === 'object' && (parsedNs.kind === 'NamespaceList' || parsedNs.kind === 'Status')) {
+          hasValidK8sNsJson = true;
+        }
+      } catch {
+        hasValidK8sNsJson = false;
+      }
+
+      if (!hasValidVersionJson && !hasValidK8sNsJson) {
+        res.status(502).json({
+          error: '目标地址返回的不是有效的 Kubernetes API JSON 响应，请检查 API Server 地址是否正确。',
+        });
+        return;
+      }
+
       res.json({
         ok: true,
         gitVersion: versionInfo.gitVersion || 'unknown',
         platform: versionInfo.platform || '',
       });
     } catch (err) {
+      if (signal.aborted || res.writableEnded) return;
       res.status(502).json({
         error: err instanceof Error ? err.message : '无法连接到 Kubernetes API Server',
       });
@@ -518,19 +695,22 @@ async function startServer() {
       res.status(400).json({ error: '缺少集群连接配置' });
       return;
     }
+    const signal = createClientAbortSignal(res);
     try {
-      const resp = await k8sRequest(config, '/api/v1/namespaces');
+      const resp = await k8sRequest(config, '/api/v1/namespaces', { timeoutMs: 20000, signal });
+      if (signal.aborted || res.writableEnded) return;
       if (resp.status >= 400) {
         res.status(resp.status).json({ error: formatK8sError(resp.status, resp.body) });
         return;
       }
-      const data = JSON.parse(resp.body) as { items?: Array<{ metadata?: { name?: string } }> };
+      const data = safeJsonParse<{ items?: Array<{ metadata?: { name?: string } }> }>(resp.body, '命名空间接口');
       const namespaces = (data.items || [])
         .map((item) => item.metadata?.name)
         .filter((name): name is string => Boolean(name))
         .sort((a, b) => a.localeCompare(b));
       res.json({ namespaces });
     } catch (err) {
+      if (signal.aborted || res.writableEnded) return;
       res.status(502).json({ error: err instanceof Error ? err.message : '获取命名空间失败' });
     }
   };
@@ -557,7 +737,7 @@ async function startServer() {
       : `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods`;
 
     interface RawPodItem {
-      metadata?: { name?: string; namespace?: string; creationTimestamp?: string; labels?: Record<string, string> };
+      metadata?: { name?: string; namespace?: string; creationTimestamp?: string; deletionTimestamp?: string; labels?: Record<string, string> };
       spec?: { nodeName?: string; containers?: Array<{ name: string; image?: string }>; initContainers?: Array<{ name: string; image?: string }> };
       status?: {
         phase?: string;
@@ -572,6 +752,8 @@ async function startServer() {
       items?: RawPodItem[];
     }
 
+    const signal = createClientAbortSignal(res);
+
     const fetchPaginatedPods = async (
       apiPath: string
     ): Promise<{ ok: true; items: RawPodItem[] } | { ok: false; status: number; body: string }> => {
@@ -580,18 +762,24 @@ async function startServer() {
       let page = 0;
 
       while (page < 40) {
+        if (signal.aborted) {
+          return { ok: false, status: 499, body: '请求已取消' };
+        }
         page += 1;
         const qs = new URLSearchParams({ limit: '500' });
         if (continueToken) qs.set('continue', continueToken);
-        const resp = await k8sRequest(config, `${apiPath}?${qs.toString()}`);
+        const resp = await k8sRequest(config, `${apiPath}?${qs.toString()}`, {
+          timeoutMs: 30000,
+          signal,
+        });
 
         if (resp.status === 410 && continueToken) {
           // Continue token expired mid-pagination; fall back to unpaginated single call
-          const fallbackResp = await k8sRequest(config, apiPath);
+          const fallbackResp = await k8sRequest(config, apiPath, { timeoutMs: 30000, signal });
           if (fallbackResp.status >= 400) {
             return { ok: false, status: fallbackResp.status, body: fallbackResp.body };
           }
-          const fallbackData = JSON.parse(fallbackResp.body) as PodListPayload;
+          const fallbackData = safeJsonParse<PodListPayload>(fallbackResp.body, 'Pod 列表接口');
           return { ok: true, items: fallbackData.items || [] };
         }
 
@@ -599,7 +787,7 @@ async function startServer() {
           return { ok: false, status: resp.status, body: resp.body };
         }
 
-        const data = JSON.parse(resp.body) as PodListPayload;
+        const data = safeJsonParse<PodListPayload>(resp.body, 'Pod 列表接口');
         if (Array.isArray(data.items)) {
           allItems.push(...data.items);
         }
@@ -616,10 +804,10 @@ async function startServer() {
       let result = await fetchPaginatedPods(baseApiPath);
 
       // If cluster-wide /api/v1/pods is forbidden by RBAC, try listing per-namespace
-      if (!result.ok && result.status === 403 && isAllNamespaces) {
-        const nsResp = await k8sRequest(config, '/api/v1/namespaces');
-        if (nsResp.status < 400) {
-          const nsData = JSON.parse(nsResp.body) as { items?: Array<{ metadata?: { name?: string } }> };
+      if (!result.ok && result.status === 403 && isAllNamespaces && !signal.aborted) {
+        const nsResp = await k8sRequest(config, '/api/v1/namespaces', { timeoutMs: 20000, signal });
+        if (nsResp.status < 400 && !signal.aborted) {
+          const nsData = safeJsonParse<{ items?: Array<{ metadata?: { name?: string } }> }>(nsResp.body, '命名空间接口');
           const nsNames = (nsData.items || [])
             .map((item) => item.metadata?.name)
             .filter((name): name is string => Boolean(name));
@@ -628,6 +816,7 @@ async function startServer() {
             const collected: RawPodItem[] = [];
             const concurrency = 8;
             for (let i = 0; i < nsNames.length; i += concurrency) {
+              if (signal.aborted) break;
               const batch = nsNames.slice(i, i + concurrency);
               const batchResults = await Promise.all(
                 batch.map((nsName) =>
@@ -707,14 +896,22 @@ async function startServer() {
           ];
 
           const waitingReason = item.status?.containerStatuses?.find((c) => c.state?.waiting?.reason)?.state?.waiting?.reason;
+          const initWaitingReason = item.status?.initContainerStatuses?.find((c) => c.state?.waiting?.reason)?.state?.waiting?.reason;
           const totalRestarts = containers.reduce((acc, c) => acc + c.restarts, 0);
+          const computedPhase = item.metadata?.deletionTimestamp
+            ? 'Terminating'
+            : waitingReason && waitingReason !== 'PodInitializing'
+              ? waitingReason
+              : initWaitingReason
+                ? `Init:${initWaitingReason}`
+                : waitingReason || item.status?.phase || 'Unknown';
 
           return {
             name: item.metadata?.name || 'unknown',
             namespace: item.metadata?.namespace || 'default',
             nodeName: item.spec?.nodeName || '-',
             podIP: item.status?.podIP || '-',
-            phase: waitingReason || item.status?.phase || 'Unknown',
+            phase: computedPhase,
             restarts: totalRestarts,
             createdAt: item.metadata?.creationTimestamp || '',
             labels: item.metadata?.labels || {},
@@ -723,8 +920,10 @@ async function startServer() {
         })
         .sort((a, b) => a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name));
 
+      if (signal.aborted || res.writableEnded) return;
       res.json({ pods });
     } catch (err) {
+      if (signal.aborted || res.writableEnded) return;
       res.status(502).json({ error: err instanceof Error ? err.message : '获取 Pod 列表失败' });
     }
   };
@@ -769,15 +968,22 @@ async function startServer() {
     if (sinceSeconds) params.set('sinceSeconds', sinceSeconds);
 
     const apiPath = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(pod)}/log?${params.toString()}`;
+    const signal = createClientAbortSignal(res);
 
     try {
-      const resp = await k8sRequest(config, apiPath);
+      const resp = await k8sRequest(config, apiPath, {
+        timeoutMs: 25000,
+        maxBytes: 20 * 1024 * 1024,
+        signal,
+      });
+      if (signal.aborted || res.writableEnded) return;
       if (resp.status >= 400) {
         res.status(resp.status).json({ error: formatK8sError(resp.status, resp.body) });
         return;
       }
       res.json({ raw: resp.body });
     } catch (err) {
+      if (signal.aborted || res.writableEnded) return;
       res.status(502).json({ error: err instanceof Error ? err.message : '拉取日志失败' });
     }
   };
