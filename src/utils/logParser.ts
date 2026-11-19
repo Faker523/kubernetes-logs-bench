@@ -176,6 +176,18 @@ export function parseRawLogs(
       if (klogMatch) {
         level = normalizeLevel(klogMatch[1]);
         message = `[${klogMatch[3]}] ${klogMatch[4]}`;
+        if (!timestampIso) {
+          const klogTime = klogMatch[2].match(/^(\d{2})(\d{2})\s+(\d{2}:\d{2}:\d{2}\.\d+)$/);
+          if (klogTime) {
+            const year = new Date().getFullYear();
+            const msStr = klogTime[3].slice(0, 12); // HH:MM:SS.mmm
+            const p = Date.parse(`${year}-${klogTime[1]}-${klogTime[2]}T${msStr}`);
+            if (!Number.isNaN(p)) {
+              timestampMs = p;
+              timestampIso = new Date(p).toISOString();
+            }
+          }
+        }
       } else {
         // Try embedded syslog-style date if no ISO prefix
         if (!timestampIso) {

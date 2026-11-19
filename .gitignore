@@ -2,6 +2,8 @@ node_modules/
 build/
 dist/
 coverage/
+server.mjs
+public/assets/aistudio/
 .DS_Store
 *.log
 .env*

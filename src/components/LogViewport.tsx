@@ -139,6 +139,7 @@ export function LogViewport({
   const [autoScroll, setAutoScroll] = useState(true);
   const [newLogCountWhilePaused, setNewLogCountWhilePaused] = useState(0);
   const prevLenRef = useRef(entries.length);
+  const prevLastSigRef = useRef<string>('');
   const [expandedStacks, setExpandedStacks] = useState<Record<string, boolean>>({});
   const [dismissedCount, setDismissedCount] = useState<number | null>(null);
   const [matchCursor, setMatchCursor] = useState(0);
@@ -200,16 +201,25 @@ export function LogViewport({
     const el = containerRef.current;
     if (!el) return;
 
+    const lastEntry = entries[entries.length - 1];
+    const lastSig = lastEntry ? `${lastEntry.timestampIso}|${lastEntry.raw}` : '';
+    const hasNewContent =
+      entries.length !== prevLenRef.current ||
+      (lastSig !== '' && lastSig !== prevLastSigRef.current);
     const delta = entries.length - prevLenRef.current;
+
     prevLenRef.current = entries.length;
+    prevLastSigRef.current = lastSig;
+
+    if (!hasNewContent) return;
 
     if (isLiveTail && autoScroll) {
       el.scrollTop = el.scrollHeight;
       setNewLogCountWhilePaused(0);
-    } else if (!autoScroll && delta > 0) {
-      setNewLogCountWhilePaused((c) => c + delta);
+    } else if (!autoScroll) {
+      setNewLogCountWhilePaused((c) => c + (delta > 0 ? delta : 1));
     }
-  }, [entries.length, isLiveTail, autoScroll]);
+  }, [entries, isLiveTail, autoScroll]);
 
   useEffect(() => {
     if (isLiveTail) {

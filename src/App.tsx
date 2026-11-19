@@ -300,6 +300,14 @@ export default function App() {
           nsSettled.status === 'fulfilled' && Array.isArray(nsSettled.value)
             ? nsSettled.value
             : [];
+
+        // If persisted namespace no longer exists in cluster, automatically fall back to __all__
+        if (ns && ns !== '__all__' && fetchedNs.length > 0 && !fetchedNs.includes(ns) && podList.length === 0) {
+          setSelectedNamespace('__all__');
+          loadPodsForCluster(activeCluster, '__all__', false);
+          return;
+        }
+
         const derivedNs = podList.map((p) => p.namespace).filter(Boolean);
         setNamespaces((prev) => {
           const merged = new Set<string>([
@@ -417,7 +425,11 @@ export default function App() {
     try {
       const tail = filters.tailLines > 0 ? filters.tailLines : 5000;
       if (isMultiPodMode) {
-        const allResults = await Promise.all(
+        if (multiPodSelection.length === 0) {
+          setRawEntries([]);
+          return;
+        }
+        const settled = await Promise.allSettled(
           multiPodSelection.map(async (item) => {
             const raw = await fetchPodLogs(
               cluster,
@@ -438,7 +450,16 @@ export default function App() {
           })
         );
         if (controller.signal.aborted || logsReqSeqRef.current !== seq) return;
-        const merged = allResults.flat().sort((a, b) => a.timestampMs - b.timestampMs);
+        const fulfilled = settled
+          .filter((r): r is PromiseFulfilledResult<LogEntry[]> => r.status === 'fulfilled')
+          .flatMap((r) => r.value);
+        if (fulfilled.length === 0) {
+          const firstErr = settled.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+          if (firstErr) {
+            throw firstErr.reason;
+          }
+        }
+        const merged = fulfilled.sort((a, b) => a.timestampMs - b.timestampMs);
         setRawEntries(merged.map((e, i) => ({ ...e, lineNumber: i + 1 })));
       } else if (selectedTarget) {
         const raw = await fetchPodLogs(
@@ -525,7 +546,7 @@ export default function App() {
         const tail = filters.tailLines > 0 ? filters.tailLines : 500;
         try {
           if (isMultiPodMode) {
-            const allResults = await Promise.all(
+            const settled = await Promise.allSettled(
               multiPodSelection.map(async (item) => {
                 const raw = await fetchPodLogs(
                   cluster,
@@ -546,8 +567,13 @@ export default function App() {
               })
             );
             if (!cancelled) {
-              const merged = allResults.flat().sort((a, b) => a.timestampMs - b.timestampMs);
-              setRawEntries(merged.map((e, i) => ({ ...e, lineNumber: i + 1 })));
+              const fulfilled = settled
+                .filter((r): r is PromiseFulfilledResult<LogEntry[]> => r.status === 'fulfilled')
+                .flatMap((r) => r.value);
+              if (fulfilled.length > 0 || settled.every((r) => r.status === 'fulfilled')) {
+                const merged = fulfilled.sort((a, b) => a.timestampMs - b.timestampMs);
+                setRawEntries(merged.map((e, i) => ({ ...e, lineNumber: i + 1 })));
+              }
             }
           } else if (selectedTarget) {
             const raw = await fetchPodLogs(
@@ -676,7 +702,12 @@ export default function App() {
       if (filters.fieldFilter) {
         const { key, value, negate } = filters.fieldFilter;
         const fieldRaw = entry.jsonPayload?.[key] ?? (key === 'trace_id' ? entry.traceId : undefined);
-        const fieldStr = fieldRaw !== undefined && fieldRaw !== null ? String(fieldRaw) : '';
+        const fieldStr =
+          fieldRaw === undefined || fieldRaw === null
+            ? ''
+            : typeof fieldRaw === 'object'
+              ? JSON.stringify(fieldRaw)
+              : String(fieldRaw);
         const equals = fieldStr === value;
         if (negate ? equals : !equals) {
           return;
@@ -1023,7 +1054,13 @@ export default function App() {
                 jsonPreview: prev.jsonPreview,
               }));
             }}
-            onRetry={loadLogs}
+            onRetry={() => {
+              if (cluster.mode === 'k8s-api' && (pods.length === 0 || (!isMultiPodMode && !selectedTarget))) {
+                loadPodsForCluster(cluster, selectedNamespace, true);
+              } else {
+                loadLogs();
+              }
+            }}
             contextMatchIds={contextMatchIds}
           />
         </main>

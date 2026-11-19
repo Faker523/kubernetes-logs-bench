@@ -49,8 +49,9 @@ docker build -t kubelog-workbench:latest .
 # 启动容器
 docker run -d --name kubelog -p 3000:3000 kubelog-workbench:latest
 
-# 可选：挂载宿主机 kubeconfig（只读）
+# 可选：挂载宿主机 kubeconfig（只读；因宿主机文件通常为 0600 权限，建议带上 --user 参数）
 docker run -d --name kubelog -p 3000:3000 \
+  --user "$(id -u):$(id -g)" \
   -v ~/.kube/config:/home/node/.kube/config:ro \
   -e KUBECONFIG=/home/node/.kube/config \
   kubelog-workbench:latest

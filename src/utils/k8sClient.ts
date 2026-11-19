@@ -1,26 +1,35 @@
 import type { ClusterConfig, PodInfo } from '../types/k8s';
 
-function toBase64(val?: string): string | undefined {
-  if (!val) return undefined;
-  try {
-    return btoa(unescape(encodeURIComponent(val)));
-  } catch {
-    return undefined;
-  }
+interface K8sProxyConfig {
+  apiServer?: string;
+  token?: string;
+  caCert?: string;
+  clientCert?: string;
+  clientKey?: string;
+  insecureTls?: boolean;
 }
 
-function buildClusterHeaders(cluster: ClusterConfig): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (cluster.apiServer?.trim()) headers['x-k8s-server'] = cluster.apiServer.trim();
-  if (cluster.token?.trim()) headers['x-k8s-token'] = cluster.token.trim();
-  if (cluster.insecureTls) headers['x-k8s-insecure'] = 'true';
-  const caB64 = toBase64(cluster.caCert);
-  if (caB64) headers['x-k8s-ca-b64'] = caB64;
-  const certB64 = toBase64(cluster.clientCert);
-  if (certB64) headers['x-k8s-cert-b64'] = certB64;
-  const keyB64 = toBase64(cluster.clientKey);
-  if (keyB64) headers['x-k8s-key-b64'] = keyB64;
-  return headers;
+function buildClusterConfig(cluster: Partial<ClusterConfig>): K8sProxyConfig {
+  return {
+    apiServer: cluster.apiServer?.trim() || undefined,
+    token: cluster.token?.trim() || undefined,
+    caCert: cluster.caCert?.trim() || undefined,
+    clientCert: cluster.clientCert?.trim() || undefined,
+    clientKey: cluster.clientKey?.trim() || undefined,
+    insecureTls: Boolean(cluster.insecureTls),
+  };
+}
+
+async function safeReadJson<T extends { error?: string }>(res: Response): Promise<T> {
+  const text = await res.text();
+  if (!text) return {} as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {
+      error: `服务端返回非 JSON 响应 (HTTP ${res.status}): ${text.slice(0, 200)}`,
+    } as T;
+  }
 }
 
 export async function testK8sConnection(config: Partial<ClusterConfig>): Promise<{
@@ -32,20 +41,23 @@ export async function testK8sConnection(config: Partial<ClusterConfig>): Promise
   const res = await fetch('/api/k8s/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      apiServer: config.apiServer,
-      token: config.token,
-      caCert: config.caCert,
-      clientCert: config.clientCert,
-      clientKey: config.clientKey,
-      insecureTls: config.insecureTls,
-    }),
+    body: JSON.stringify(buildClusterConfig(config)),
   });
-  const data = await res.json();
+  const data = await safeReadJson<{
+    ok?: boolean;
+    gitVersion?: string;
+    platform?: string;
+    error?: string;
+  }>(res);
   if (!res.ok) {
     return { ok: false, error: data.error || `HTTP ${res.status}` };
   }
-  return data;
+  return {
+    ok: Boolean(data.ok),
+    gitVersion: data.gitVersion,
+    platform: data.platform,
+    error: data.error,
+  };
 }
 
 export async function parseKubeconfigText(kubeconfig: string): Promise<{
@@ -63,7 +75,16 @@ export async function parseKubeconfigText(kubeconfig: string): Promise<{
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kubeconfig }),
   });
-  const data = await res.json();
+  const data = await safeReadJson<{
+    name?: string;
+    apiServer?: string;
+    token?: string;
+    caCert?: string;
+    clientCert?: string;
+    clientKey?: string;
+    insecureTls?: boolean;
+    error?: string;
+  }>(res);
   if (!res.ok) {
     throw new Error(data.error || '解析 kubeconfig 失败');
   }
@@ -80,7 +101,19 @@ export async function getLocalKubeconfigStatus(): Promise<{
   if (!res.ok) {
     return { hasLocalKubeconfig: false, kubeconfigReadable: false, kubeconfigPath: null, hasInCluster: false };
   }
-  return res.json();
+  const data = await safeReadJson<{
+    hasLocalKubeconfig?: boolean;
+    kubeconfigReadable?: boolean;
+    kubeconfigPath?: string | null;
+    hasInCluster?: boolean;
+    error?: string;
+  }>(res);
+  return {
+    hasLocalKubeconfig: Boolean(data.hasLocalKubeconfig),
+    kubeconfigReadable: Boolean(data.kubeconfigReadable),
+    kubeconfigPath: data.kubeconfigPath ?? null,
+    hasInCluster: Boolean(data.hasInCluster),
+  };
 }
 
 export async function loadLocalKubeconfig(): Promise<{
@@ -93,7 +126,16 @@ export async function loadLocalKubeconfig(): Promise<{
   insecureTls?: boolean;
 }> {
   const res = await fetch('/api/k8s/local-load', { method: 'POST' });
-  const data = await res.json();
+  const data = await safeReadJson<{
+    name?: string;
+    apiServer?: string;
+    token?: string;
+    caCert?: string;
+    clientCert?: string;
+    clientKey?: string;
+    insecureTls?: boolean;
+    error?: string;
+  }>(res);
   if (!res.ok) {
     throw new Error(data.error || '加载本地 kubeconfig 失败');
   }
@@ -105,10 +147,12 @@ export async function fetchNamespaces(
   signal?: AbortSignal
 ): Promise<string[]> {
   const res = await fetch('/api/k8s/namespaces', {
-    headers: buildClusterHeaders(cluster),
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: buildClusterConfig(cluster) }),
     signal,
   });
-  const data = await res.json();
+  const data = await safeReadJson<{ namespaces?: string[]; error?: string }>(res);
   if (!res.ok) {
     throw new Error(data.error || `获取命名空间失败 (${res.status})`);
   }
@@ -120,13 +164,16 @@ export async function fetchPods(
   namespace: string,
   signal?: AbortSignal
 ): Promise<PodInfo[]> {
-  const params = new URLSearchParams();
-  if (namespace) params.set('namespace', namespace);
-  const res = await fetch(`/api/k8s/pods?${params.toString()}`, {
-    headers: buildClusterHeaders(cluster),
+  const res = await fetch('/api/k8s/pods', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      config: buildClusterConfig(cluster),
+      namespace,
+    }),
     signal,
   });
-  const data = await res.json();
+  const data = await safeReadJson<{ pods?: PodInfo[]; error?: string }>(res);
   if (!res.ok) {
     throw new Error(data.error || `获取 Pod 列表失败 (${res.status})`);
   }
@@ -145,21 +192,21 @@ export async function fetchPodLogs(
   },
   signal?: AbortSignal
 ): Promise<string> {
-  const qs = new URLSearchParams({
-    namespace: params.namespace,
-    pod: params.pod,
-    container: params.container,
-    tailLines: String(params.tailLines || 500),
-    previous: String(params.previous),
-  });
-  if (params.sinceSeconds) {
-    qs.set('sinceSeconds', String(params.sinceSeconds));
-  }
-  const res = await fetch(`/api/k8s/logs?${qs.toString()}`, {
-    headers: buildClusterHeaders(cluster),
+  const res = await fetch('/api/k8s/logs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      config: buildClusterConfig(cluster),
+      namespace: params.namespace,
+      pod: params.pod,
+      container: params.container,
+      tailLines: params.tailLines || 500,
+      previous: params.previous,
+      sinceSeconds: params.sinceSeconds,
+    }),
     signal,
   });
-  const data = await res.json();
+  const data = await safeReadJson<{ raw?: string; error?: string }>(res);
   if (!res.ok) {
     throw new Error(data.error || `获取日志失败 (${res.status})`);
   }

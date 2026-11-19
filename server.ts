@@ -77,7 +77,7 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
     }
 
     const reqOptions: https.RequestOptions = {
-      hostname: targetUrl.hostname,
+      hostname: targetUrl.hostname.replace(/^\[|\]$/g, ''),
       port: targetUrl.port || (isHttps ? 443 : 80),
       path: `${targetUrl.pathname}${targetUrl.search}`,
       method: 'GET',
@@ -97,11 +97,24 @@ function k8sRequest(config: K8sRequestConfig, apiPath: string): Promise<K8sHttpR
       }
     }
 
+    const MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
     const transport = isHttps ? https : http;
     const req = transport.request(reqOptions, (res) => {
       const chunks: Buffer[] = [];
-      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      let totalBytes = 0;
+      let abortedForSize = false;
+
+      res.on('data', (chunk: Buffer) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_RESPONSE_BYTES) {
+          abortedForSize = true;
+          req.destroy(new Error('Kubernetes API 响应体积超过 25MB 限制，请调小拉取行数 (tailLines)'));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('end', () => {
+        if (abortedForSize) return;
         resolve({
           status: res.statusCode ?? 500,
           body: Buffer.concat(chunks).toString('utf8'),
@@ -141,6 +154,21 @@ function extractConfigFromHeaders(req: express.Request): K8sRequestConfig | null
     clientCert: decodeOpt(req.header('x-k8s-cert-b64')),
     clientKey: decodeOpt(req.header('x-k8s-key-b64')),
   };
+}
+
+function extractConfigFromRequest(req: express.Request): K8sRequestConfig | null {
+  const bodyConfig = (req.body as { config?: K8sRequestConfig } | undefined)?.config;
+  if (bodyConfig?.apiServer?.trim()) {
+    return {
+      apiServer: bodyConfig.apiServer.trim(),
+      token: bodyConfig.token?.trim() || undefined,
+      insecureTls: Boolean(bodyConfig.insecureTls),
+      caCert: bodyConfig.caCert?.trim() || undefined,
+      clientCert: bodyConfig.clientCert?.trim() || undefined,
+      clientKey: bodyConfig.clientKey?.trim() || undefined,
+    };
+  }
+  return extractConfigFromHeaders(req);
 }
 
 function formatK8sError(status: number, body: string): string {
@@ -188,7 +216,7 @@ function splitYamlListItems(sectionText: string): Array<{ name?: string; body: s
 }
 
 function extractYamlSection(raw: string, sectionName: string): string {
-  const re = new RegExp(`^${sectionName}:\\s*\\r?\\n([\\s\\S]*?)(?=^[a-zA-Z0-9_-]+:|(?![\\s\\S]))`, 'm');
+  const re = new RegExp(`^${sectionName}:\\s*\\r?\\n([\\s\\S]*?)(?=^[a-zA-Z][a-zA-Z0-9_-]*:|(?![\\s\\S]))`, 'm');
   const m = raw.match(re);
   return m?.[1] || '';
 }
@@ -484,8 +512,8 @@ async function startServer() {
   });
 
   // List Namespaces
-  app.get('/api/k8s/namespaces', async (req, res) => {
-    const config = extractConfigFromHeaders(req);
+  const handleListNamespaces: express.RequestHandler = async (req, res) => {
+    const config = extractConfigFromRequest(req);
     if (!config) {
       res.status(400).json({ error: '缺少集群连接配置' });
       return;
@@ -505,16 +533,24 @@ async function startServer() {
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '获取命名空间失败' });
     }
-  });
+  };
+  app.get('/api/k8s/namespaces', handleListNamespaces);
+  app.post('/api/k8s/namespaces', handleListNamespaces);
 
   // List Pods (with pagination & RBAC per-namespace fallback for __all__)
-  app.get('/api/k8s/pods', async (req, res) => {
-    const config = extractConfigFromHeaders(req);
+  const handleListPods: express.RequestHandler = async (req, res) => {
+    const config = extractConfigFromRequest(req);
     if (!config) {
       res.status(400).json({ error: '缺少集群连接配置' });
       return;
     }
-    const namespace = typeof req.query.namespace === 'string' ? req.query.namespace : '';
+    const bodyNs = (req.body as { namespace?: string } | undefined)?.namespace;
+    const namespace =
+      typeof bodyNs === 'string'
+        ? bodyNs
+        : typeof req.query.namespace === 'string'
+          ? req.query.namespace
+          : '';
     const isAllNamespaces = !namespace || namespace === '__all__';
     const baseApiPath = isAllNamespaces
       ? '/api/v1/pods'
@@ -691,21 +727,33 @@ async function startServer() {
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '获取 Pod 列表失败' });
     }
-  });
+  };
+  app.get('/api/k8s/pods', handleListPods);
+  app.post('/api/k8s/pods', handleListPods);
 
   // Fetch Pod Container Logs
-  app.get('/api/k8s/logs', async (req, res) => {
-    const config = extractConfigFromHeaders(req);
+  const handleFetchLogs: express.RequestHandler = async (req, res) => {
+    const config = extractConfigFromRequest(req);
     if (!config) {
       res.status(400).json({ error: '缺少集群连接配置' });
       return;
     }
-    const namespace = String(req.query.namespace || 'default');
-    const pod = String(req.query.pod || '');
-    const container = String(req.query.container || '');
-    const tailLines = String(req.query.tailLines || '500');
-    const previous = req.query.previous === 'true';
-    const sinceSeconds = req.query.sinceSeconds ? String(req.query.sinceSeconds) : '';
+    const body = (req.body as {
+      namespace?: string;
+      pod?: string;
+      container?: string;
+      tailLines?: number | string;
+      previous?: boolean | string;
+      sinceSeconds?: number | string;
+    } | undefined) || {};
+
+    const namespace = String(body.namespace ?? req.query.namespace ?? 'default');
+    const pod = String(body.pod ?? req.query.pod ?? '');
+    const container = String(body.container ?? req.query.container ?? '');
+    const tailLines = String(body.tailLines ?? req.query.tailLines ?? '500');
+    const previous = body.previous === true || body.previous === 'true' || req.query.previous === 'true';
+    const sinceVal = body.sinceSeconds ?? req.query.sinceSeconds;
+    const sinceSeconds = sinceVal ? String(sinceVal) : '';
 
     if (!pod) {
       res.status(400).json({ error: '缺少 pod 参数' });
@@ -732,7 +780,9 @@ async function startServer() {
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : '拉取日志失败' });
     }
-  });
+  };
+  app.get('/api/k8s/logs', handleFetchLogs);
+  app.post('/api/k8s/logs', handleFetchLogs);
 
   // Vite middleware for dev, static files for prod
   if (process.env.NODE_ENV !== 'production') {
